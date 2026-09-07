@@ -129,7 +129,12 @@ class TaskRunner:
         use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
         self_distillation_cfg = config.actor_rollout_ref.actor.get("self_distillation", None)
         loss_mode = config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
-        self_distillation_needs_ref = self_distillation_cfg is not None and loss_mode == "vopd"
+        # OPSA (opsa_enable) is zero-supervision: no teacher/ref module is needed at all.
+        self_distillation_needs_ref = (
+            self_distillation_cfg is not None
+            and loss_mode == "vopd"
+            and not self_distillation_cfg.get("opsa_enable", False)
+        )
         teacher_model_source = self_distillation_cfg.get("teacher_model_source", "legacy") if self_distillation_cfg else None
         if self_distillation_needs_ref and need_reference_policy(config) and teacher_model_source == "legacy":
             raise ValueError(

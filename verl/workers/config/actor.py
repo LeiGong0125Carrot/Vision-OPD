@@ -147,6 +147,16 @@ class SelfDistillationConfig(BaseConfig):
     evt_neutral_base: float = 0.0
     evt_ubar_init: Optional[str] = None  # json {token_id: ubar} warm start (probe snapshot)
     evt_negative_only: bool = False  # EVT-neg: advantage=min(u_tilde,0) — gems pardoned, never boosted
+    # --- OPSA: On-Policy Self-Adaptation (arXiv 2608.31046, official impl in
+    # TreeVGR/OPSA-code/slime/.../opsa.py). Zero-supervision baseline: entropy-adaptive
+    # negative advantages on the batch-level lowest-logp tokens; no teacher forward,
+    # no rewards, no labels. Loss is the PPO clipped surrogate over selected tokens only.
+    opsa_enable: bool = False
+    opsa_mode: str = "entropy"  # "entropy" | "fixed"
+    opsa_token_fraction: float = 0.2
+    opsa_advantage_min: float = -1.0  # highest-entropy selected token gets this
+    opsa_advantage_max: float = -0.5  # lowest-entropy selected token gets this
+    opsa_fixed_advantage: Optional[float] = None  # only for opsa_mode="fixed"
 
     def __post_init__(self):
         if not 0.0 <= self.alpha <= 1.0:
@@ -193,6 +203,24 @@ class SelfDistillationConfig(BaseConfig):
                 raise ValueError("evt_clip_neg/evt_clip_pos must be positive magnitudes.")
             if not 0.0 < self.evt_ema_eta <= 1.0:
                 raise ValueError(f"evt_ema_eta must be in (0,1], got {self.evt_ema_eta}")
+        if self.opsa_enable:
+            if self.state_adaptive or self.evt_enable:
+                raise ValueError("opsa_enable is mutually exclusive with state_adaptive and evt_enable.")
+            if not 0.0 < self.opsa_token_fraction <= 1.0:
+                raise ValueError(f"opsa_token_fraction must be in (0,1], got {self.opsa_token_fraction}")
+            if self.opsa_mode == "entropy":
+                if not self.opsa_advantage_min < self.opsa_advantage_max < 0:
+                    raise ValueError(
+                        "opsa_advantage_min/max must satisfy min < max < 0, got "
+                        f"{self.opsa_advantage_min} / {self.opsa_advantage_max}"
+                    )
+                if self.opsa_fixed_advantage is not None:
+                    raise ValueError("opsa_fixed_advantage is only valid with opsa_mode='fixed'.")
+            elif self.opsa_mode == "fixed":
+                if self.opsa_fixed_advantage is None or self.opsa_fixed_advantage == 0:
+                    raise ValueError("opsa_mode='fixed' requires a non-zero opsa_fixed_advantage.")
+            else:
+                raise ValueError(f"opsa_mode must be 'entropy' or 'fixed', got {self.opsa_mode!r}")
         if self.teacher_prompt_mode is not None and self.teacher_prompt_mode != "answer_hint":
             raise ValueError(
                 f"self_distillation.teacher_prompt_mode must be None or 'answer_hint', got {self.teacher_prompt_mode}"

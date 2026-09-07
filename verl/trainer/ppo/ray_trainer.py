@@ -653,6 +653,9 @@ class RayPPOTrainer:
         loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
         if self_distillation_cfg is None or loss_mode != "vopd":
             return False
+        if self_distillation_cfg.get("opsa_enable", False):
+            # OPSA: zero-supervision training — reward is always bypassed, no teacher data needed.
+            return True
         if not self_distillation_cfg.get("teacher_always_on", False):
             return False
         if self_distillation_cfg.get("fallback_to_policy_loss_on_missing_teacher", False):
@@ -1143,6 +1146,9 @@ class RayPPOTrainer:
         self_distillation_cfg = self.config.actor_rollout_ref.actor.get("self_distillation", None)
         loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
         if self_distillation_cfg is None or loss_mode != "vopd":
+            return None
+        if self_distillation_cfg.get("opsa_enable", False):
+            # OPSA: zero-supervision — no teacher inputs are built at all.
             return None
 
         device = batch.batch["input_ids"].device

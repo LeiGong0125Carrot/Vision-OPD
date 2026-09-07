@@ -213,6 +213,25 @@ self_distillation:
   # EVT-neg: negative-only advantage (min(u_tilde,0)); gems pardoned from suppression, never boosted
   evt_negative_only: False
 
+  # OPSA (arXiv 2608.31046): zero-supervision entropy-adaptive negative advantages on the
+  # batch-level lowest-logp tokens. No teacher forward, no rewards, no labels.
+  # Requires actor.calculate_entropy=True in entropy mode. Mutually exclusive with
+  # state_adaptive / evt_enable.
+  opsa_enable: False
+
+  # "entropy" (adaptive, paper default) or "fixed" (constant opsa_fixed_advantage)
+  opsa_mode: entropy
+
+  # Fraction of valid response tokens selected (batch-level lowest student logp)
+  opsa_token_fraction: 0.2
+
+  # Advantage range: highest-entropy selected token -> min, lowest-entropy -> max
+  opsa_advantage_min: -1.0
+  opsa_advantage_max: -0.5
+
+  # Constant advantage for opsa_mode=fixed (must be non-zero)
+  opsa_fixed_advantage: null
+
   # IS clip for loss; null disables IS weighting
   is_clip: 2
 

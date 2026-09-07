@@ -1517,6 +1517,102 @@ def compute_evt_loss(
     return loss, metrics
 
 
+def compute_opsa_loss(
+    log_prob: torch.Tensor,
+    old_log_prob: torch.Tensor,
+    entropys: Optional[torch.Tensor],
+    response_mask: torch.Tensor,
+    actor_config: Any,
+    self_distillation_config: Any,
+    self_distillation_mask: Optional[torch.Tensor] = None,
+    rollout_is_weights: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """OPSA: On-Policy Self-Adaptation (arXiv 2608.31046).
+
+    Faithful port of the official implementation (TreeVGR/OPSA-code/slime/slime/backends/
+    megatron_utils/opsa.py + loss.py): select the batch-level lowest ``floor(frac*N)``
+    valid tokens by detached student logp (stable argsort, ties by position); in entropy
+    mode assign A = adv_max + (adv_min - adv_max) * rank, where rank is the min-max
+    normalized entropy WITHIN the selected set (highest entropy -> adv_min = strongest
+    suppression); degenerate entropy range -> all adv_min. The loss is the standard PPO
+    clipped surrogate restricted to selected tokens, normalized by the selected count.
+    Zero external supervision: no teacher forward, no rewards, no labels.
+    """
+    cfg = self_distillation_config
+    metrics: dict[str, Any] = {}
+    mode = cfg.get("opsa_mode", "entropy")
+    frac = float(cfg.get("opsa_token_fraction", 0.2))
+    adv_min = float(cfg.get("opsa_advantage_min", -1.0))
+    adv_max = float(cfg.get("opsa_advantage_max", -0.5))
+    fixed = cfg.get("opsa_fixed_advantage", None)
+    if mode == "entropy" and entropys is None:
+        raise ValueError(
+            "OPSA entropy mode needs per-token entropy from the training forward; "
+            "set actor_rollout_ref.actor.calculate_entropy=True."
+        )
+
+    valid = response_mask
+    if self_distillation_mask is not None:
+        valid = valid * self_distillation_mask.unsqueeze(1)
+
+    with torch.no_grad():
+        flat_lp = log_prob.detach().float().reshape(-1)
+        flat_valid = (valid > 0.5).reshape(-1)
+        sel_flat = torch.zeros_like(flat_lp)
+        adv_flat = torch.zeros_like(flat_lp)
+        n_valid = int(flat_valid.sum())
+        if n_valid > 0:
+            k = min(max(1, int(frac * n_valid)), n_valid)
+            vidx = torch.nonzero(flat_valid, as_tuple=False).flatten()
+            order = torch.argsort(flat_lp[vidx], stable=True)
+            sel_idx = vidx[order[:k]]
+            sel_flat[sel_idx] = 1.0
+            if mode == "fixed":
+                adv_flat[sel_idx] = float(fixed)
+            else:
+                sel_ent = entropys.detach().float().reshape(-1)[sel_idx]
+                ent_range = sel_ent.max() - sel_ent.min()
+                if ent_range <= 1e-12:
+                    rank = torch.ones_like(sel_ent)
+                else:
+                    rank = (sel_ent - sel_ent.min()) / ent_range
+                adv_flat[sel_idx] = adv_max + (adv_min - adv_max) * rank
+        sel = sel_flat.reshape_as(log_prob)
+        advantages = adv_flat.reshape_as(log_prob)
+
+    # PPO clipped surrogate (slime ppo_utils.compute_policy_loss semantics). On-policy
+    # single-mini-batch training has ratio == 1 (old_log_prob = log_prob.detach()),
+    # matching the official num_steps_per_rollout=1 recipe; the clip is a guardrail for
+    # multi-epoch / multi-mini-batch settings.
+    clip_low = getattr(actor_config, "clip_ratio_low", None) or getattr(actor_config, "clip_ratio", 0.2)
+    clip_high = getattr(actor_config, "clip_ratio_high", None) or getattr(actor_config, "clip_ratio", 0.2)
+    ratio = torch.exp(log_prob - old_log_prob)
+    pg_losses1 = -ratio * advantages
+    pg_losses2 = -ratio.clamp(1.0 - clip_low, 1.0 + clip_high) * advantages
+    per_token_loss = torch.maximum(pg_losses1, pg_losses2)
+    if rollout_is_weights is not None:
+        per_token_loss = per_token_loss * rollout_is_weights
+
+    n_sel = sel.sum().clamp(min=1.0)
+    loss = (per_token_loss * sel).sum() / n_sel
+
+    def _m(x, mask):
+        return (verl_F.masked_sum(x, mask) / mask.sum().clamp(min=1.0)).detach().item()
+
+    metrics["opsa/selected_tokens"] = float(n_sel.detach().item())
+    metrics["opsa/selected_fraction"] = float(n_sel.detach().item()) / max(n_valid, 1)
+    metrics["opsa/advantage_mean"] = _m(advantages, sel)
+    metrics["opsa/clipfrac"] = _m((pg_losses2 > pg_losses1).float().detach(), sel)
+    metrics["opsa/sel_logp_mean"] = _m(log_prob.detach(), sel)
+    if mode == "entropy" and entropys is not None and n_valid > 0:
+        sel_ent_stats = entropys.detach().float().reshape(-1)[sel_idx]
+        metrics["opsa/sel_entropy_mean"] = float(sel_ent_stats.mean().item())
+        metrics["opsa/sel_entropy_max"] = float(sel_ent_stats.max().item())
+        metrics["opsa/sel_entropy_min"] = float(sel_ent_stats.min().item())
+    metrics["self_distillation/num_distill_tokens"] = float(n_sel.detach().item())
+    return loss, metrics
+
+
 @deprecated("verl.trainer.ppo.core_algos.compute_policy_loss_vanilla")
 def compute_policy_loss(
     old_log_prob,

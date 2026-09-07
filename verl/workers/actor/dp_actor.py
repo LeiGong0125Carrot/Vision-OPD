@@ -33,6 +33,7 @@ from verl import DataProto
 from verl.trainer.ppo.core_algos import (
     agg_loss,
     compute_evt_loss,
+    compute_opsa_loss,
     compute_self_distillation_loss,
     compute_state_adaptive_distillation_loss,
     get_policy_loss_fn,
@@ -863,14 +864,18 @@ class DataParallelPPOActor(BasePPOActor):
         if self_distillation_enabled:
             if self_distillation_cfg is None:
                 raise ValueError(f"loss_mode={loss_mode} requires actor.self_distillation config.")
-            self_distillation_required_keys = {
-                "teacher_input_ids",
-                "teacher_attention_mask",
-                "teacher_position_ids",
-                "teacher_response_start_idx",
-                "self_distillation_mask",
-            }
-            assert self_distillation_required_keys.issubset(set(data.batch.keys())), f"Missing required keys: {self_distillation_required_keys - set(data.batch.keys())}"
+            if self_distillation_cfg.get("opsa_enable", False):
+                # OPSA is zero-supervision: no teacher inputs exist in the batch.
+                self_distillation_required_keys = set()
+            else:
+                self_distillation_required_keys = {
+                    "teacher_input_ids",
+                    "teacher_attention_mask",
+                    "teacher_position_ids",
+                    "teacher_response_start_idx",
+                    "self_distillation_mask",
+                }
+                assert self_distillation_required_keys.issubset(set(data.batch.keys())), f"Missing required keys: {self_distillation_required_keys - set(data.batch.keys())}"
 
         select_keys = [
             "responses",
@@ -1017,7 +1022,33 @@ class DataParallelPPOActor(BasePPOActor):
                     # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
                     rollout_is_weights = model_inputs.get("rollout_is_weights", None)
 
-                    if self_distillation_enabled:
+                    opsa_enable = self_distillation_enabled and self_distillation_cfg.get("opsa_enable", False)
+                    if opsa_enable:
+                        # OPSA (arXiv 2608.31046): 零监督基线 — 不做任何 teacher forward,
+                        # advantage 完全来自学生自己的 logp 排序 + 熵缩放。
+                        if policy_fallback_mask is not None and policy_fallback_mask.any().item():
+                            raise ValueError(
+                                "OPSA expects teacher_always_on data (self_distillation_mask all ones); "
+                                "got samples on the GRPO fallback path."
+                            )
+                        loss_compute_start = time.perf_counter()
+                        vopd_loss, vopd_metrics = compute_opsa_loss(
+                            log_prob=log_prob,
+                            old_log_prob=old_log_prob,
+                            entropys=entropy,
+                            response_mask=response_mask,
+                            actor_config=self.config,
+                            self_distillation_config=self_distillation_cfg,
+                            self_distillation_mask=self_distillation_mask,
+                            rollout_is_weights=rollout_is_weights,
+                        )
+                        stage_wall_time_totals["timing_s/update_actor/loss_compute"] += (
+                            time.perf_counter() - loss_compute_start
+                        )
+                        micro_batch_metrics.update(vopd_metrics)
+                        grpo_loss = None
+                        pg_loss = vopd_loss
+                    elif self_distillation_enabled:
                         teacher_inputs = {
                             "responses": model_inputs["responses"],
                             "input_ids": model_inputs["teacher_input_ids"],
