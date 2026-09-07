@@ -144,6 +144,9 @@ class DataParallelPPOActor(BasePPOActor):
         loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
         if not self_distillation_cfg or loss_mode != "vopd":
             return
+        if self_distillation_cfg.get("opsa_enable", False):
+            # OPSA is zero-supervision: no teacher module exists, nothing to update.
+            return
         teacher_model_source = getattr(self_distillation_cfg, "teacher_model_source", "legacy")
         if teacher_model_source != "legacy":
             return
