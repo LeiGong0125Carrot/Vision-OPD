@@ -206,6 +206,11 @@ def should_reuse_rollout_log_probs_as_old_log_probs(config, batch: DataProto) ->
         return False
 
     actor_cfg = config.actor_rollout_ref.actor
+    self_distillation_cfg = actor_cfg.get("self_distillation", None)
+    if self_distillation_cfg is not None and self_distillation_cfg.get("opsa_enable", False):
+        # OPSA requires actor-recomputed log-probs (official refuses rollout logprobs):
+        # the recompute pass also yields the batch-level entropys used for token selection.
+        return False
     if actor_cfg.ppo_epochs != 1:
         return False
 
@@ -2491,6 +2496,26 @@ class RayPPOTrainer:
                                 "perf/mfu/actor_infer": old_log_prob_mfu,
                             }
                             metrics.update(old_log_prob_metrics)
+                            self_distillation_cfg = actor_config.get("self_distillation", None)
+                            if (
+                                self_distillation_cfg is not None
+                                and self_distillation_cfg.get("opsa_enable", False)
+                                and actor_config.policy_loss.get("loss_mode", "vanilla") == "vopd"
+                            ):
+                                # OPSA official semantics: batch-level token selection over the
+                                # WHOLE train batch (actor-recomputed logp + entropys), BEFORE
+                                # micro-batching — confident responses may get zero selection.
+                                from verl.trainer.ppo.core_algos import compute_opsa_selection
+
+                                opsa_adv, opsa_sel, opsa_metrics = compute_opsa_selection(
+                                    old_log_prob.batch["old_log_probs"],
+                                    entropys,
+                                    response_masks,
+                                    self_distillation_cfg,
+                                )
+                                batch.batch["advantages"] = opsa_adv
+                                batch.batch["opsa_mask"] = opsa_sel
+                                metrics.update(opsa_metrics)
                             old_log_prob.batch.pop("entropys")
                             batch = batch.union(old_log_prob)
                             if "rollout_log_probs" in batch.batch.keys():

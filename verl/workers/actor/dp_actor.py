@@ -890,6 +890,8 @@ class DataParallelPPOActor(BasePPOActor):
         ]
         if not self_distillation_enabled or "advantages" in data.batch.keys():
             select_keys.append("advantages")
+        if "opsa_mask" in data.batch.keys():
+            select_keys.append("opsa_mask")
         if self.use_prefix_grouper and "prompts" in data.batch.keys():
             select_keys.append("prompts")
         if self.config.use_kl_loss:
@@ -1044,6 +1046,10 @@ class DataParallelPPOActor(BasePPOActor):
                             self_distillation_config=self_distillation_cfg,
                             self_distillation_mask=self_distillation_mask,
                             rollout_is_weights=rollout_is_weights,
+                            # v2a: 官方语义 — driver 已在全 batch 上完成选择 (advantages +
+                            # opsa_mask 随 batch 切片进 micro); 缺失时回退 micro 级选择 (v1)。
+                            precomputed_advantages=model_inputs.get("advantages"),
+                            precomputed_mask=model_inputs.get("opsa_mask"),
                         )
                         stage_wall_time_totals["timing_s/update_actor/loss_compute"] += (
                             time.perf_counter() - loss_compute_start

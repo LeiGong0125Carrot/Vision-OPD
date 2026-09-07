@@ -121,6 +121,8 @@ python3 -m verl.trainer.main_ppo --config-name "$CONFIG_NAME" \
     actor_rollout_ref.rollout.n=$ROLLOUT_N \
     actor_rollout_ref.actor.optim.lr=$LR \
     actor_rollout_ref.actor.optim.lr_warmup_steps=$LR_WARMUP_STEPS \
+    "actor_rollout_ref.actor.optim.betas=[0.9,0.98]" \
+    actor_rollout_ref.actor.optim.weight_decay=0.1 \
     actor_rollout_ref.actor.ppo_mini_batch_size=$PPO_MINI_BATCH_SIZE \
     actor_rollout_ref.actor.use_dynamic_bsz=$ACTOR_USE_DYNAMIC_BSZ \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=$ACTOR_PPO_MICRO_BS \

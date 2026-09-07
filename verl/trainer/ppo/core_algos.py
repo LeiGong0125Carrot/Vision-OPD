@@ -1517,50 +1517,41 @@ def compute_evt_loss(
     return loss, metrics
 
 
-def compute_opsa_loss(
-    log_prob: torch.Tensor,
-    old_log_prob: torch.Tensor,
+def compute_opsa_selection(
+    log_probs: torch.Tensor,
     entropys: Optional[torch.Tensor],
     response_mask: torch.Tensor,
-    actor_config: Any,
     self_distillation_config: Any,
-    self_distillation_mask: Optional[torch.Tensor] = None,
-    rollout_is_weights: Optional[torch.Tensor] = None,
-) -> tuple[torch.Tensor, dict[str, Any]]:
-    """OPSA: On-Policy Self-Adaptation (arXiv 2608.31046).
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+    """OPSA batch-level token selection + entropy-adaptive advantages (arXiv 2608.31046).
 
-    Faithful port of the official implementation (TreeVGR/OPSA-code/slime/slime/backends/
-    megatron_utils/opsa.py + loss.py): select the batch-level lowest ``floor(frac*N)``
-    valid tokens by detached student logp (stable argsort, ties by position); in entropy
-    mode assign A = adv_max + (adv_min - adv_max) * rank, where rank is the min-max
-    normalized entropy WITHIN the selected set (highest entropy -> adv_min = strongest
-    suppression); degenerate entropy range -> all adv_min. The loss is the standard PPO
-    clipped surrogate restricted to selected tokens, normalized by the selected count.
-    Zero external supervision: no teacher forward, no rewards, no labels.
+    Faithful port of official compute_opsa (TreeVGR/OPSA-code/slime/.../opsa.py): pool ALL
+    valid response tokens of the given batch, select the lowest ``max(1, floor(frac*N))``
+    by log-prob (stable argsort, ties by position); entropy mode assigns
+    A = adv_max + (adv_min - adv_max) * rank with rank the min-max normalized entropy
+    WITHIN the selected set (highest entropy -> adv_min = strongest suppression);
+    degenerate range -> all adv_min. Called at the driver on the whole train batch with
+    actor-recomputed old_log_probs + entropys (official semantics: selection BEFORE
+    micro-batching, so confident responses can contribute zero selected tokens).
+
+    Returns (advantages, sel_mask, metrics), advantages/sel_mask shaped like log_probs.
     """
     cfg = self_distillation_config
-    metrics: dict[str, Any] = {}
     mode = cfg.get("opsa_mode", "entropy")
     frac = float(cfg.get("opsa_token_fraction", 0.2))
     adv_min = float(cfg.get("opsa_advantage_min", -1.0))
     adv_max = float(cfg.get("opsa_advantage_max", -0.5))
     fixed = cfg.get("opsa_fixed_advantage", None)
     if mode == "entropy" and entropys is None:
-        raise ValueError(
-            "OPSA entropy mode needs per-token entropy from the training forward; "
-            "set actor_rollout_ref.actor.calculate_entropy=True."
-        )
-
-    valid = response_mask
-    if self_distillation_mask is not None:
-        valid = valid * self_distillation_mask.unsqueeze(1)
+        raise ValueError("OPSA entropy mode requires per-token entropys.")
 
     with torch.no_grad():
-        flat_lp = log_prob.detach().float().reshape(-1)
-        flat_valid = (valid > 0.5).reshape(-1)
+        flat_lp = log_probs.detach().float().reshape(-1)
+        flat_valid = (response_mask > 0.5).reshape(-1)
         sel_flat = torch.zeros_like(flat_lp)
         adv_flat = torch.zeros_like(flat_lp)
         n_valid = int(flat_valid.sum())
+        sel_idx = None
         if n_valid > 0:
             k = min(max(1, int(frac * n_valid)), n_valid)
             vidx = torch.nonzero(flat_valid, as_tuple=False).flatten()
@@ -1577,8 +1568,64 @@ def compute_opsa_loss(
                 else:
                     rank = (sel_ent - sel_ent.min()) / ent_range
                 adv_flat[sel_idx] = adv_max + (adv_min - adv_max) * rank
-        sel = sel_flat.reshape_as(log_prob)
-        advantages = adv_flat.reshape_as(log_prob)
+        sel = sel_flat.reshape_as(log_probs)
+        advantages = adv_flat.reshape_as(log_probs)
+
+    metrics: dict[str, Any] = {
+        "opsa/selected_tokens": float(sel.sum().item()),
+        "opsa/selected_fraction": float(sel.sum().item()) / max(n_valid, 1),
+        "opsa/advantage_mean": float((advantages * sel).sum().item() / max(sel.sum().item(), 1.0)),
+        "opsa/sel_logp_mean": float((log_probs.detach() * sel).sum().item() / max(sel.sum().item(), 1.0)),
+        # 每条 response 被选中的 token 数分布: 官方语义的核心是自信 response 可以为 0
+        "opsa/zero_sel_responses": float(((sel.sum(dim=-1) == 0) & (response_mask.sum(dim=-1) > 0)).sum().item()),
+    }
+    if mode == "entropy" and sel_idx is not None:
+        sel_ent_stats = entropys.detach().float().reshape(-1)[sel_idx]
+        metrics["opsa/sel_entropy_mean"] = float(sel_ent_stats.mean().item())
+        metrics["opsa/sel_entropy_max"] = float(sel_ent_stats.max().item())
+        metrics["opsa/sel_entropy_min"] = float(sel_ent_stats.min().item())
+    return advantages, sel, metrics
+
+
+def compute_opsa_loss(
+    log_prob: torch.Tensor,
+    old_log_prob: torch.Tensor,
+    entropys: Optional[torch.Tensor],
+    response_mask: torch.Tensor,
+    actor_config: Any,
+    self_distillation_config: Any,
+    self_distillation_mask: Optional[torch.Tensor] = None,
+    rollout_is_weights: Optional[torch.Tensor] = None,
+    precomputed_advantages: Optional[torch.Tensor] = None,
+    precomputed_mask: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """OPSA loss (arXiv 2608.31046): PPO clipped surrogate over the selected tokens,
+    normalized by the micro-batch selected count (with 1/grad_accum scaling this equals
+    the official per-sample selected-mean averaged over the global batch; zero-selection
+    samples contribute 0 to the numerator and stay in the denominator, matching slime's
+    filtered_sum_of_sample_mean).
+
+    Selection source, in order of preference:
+    1. ``precomputed_advantages``/``precomputed_mask`` — batch-level selection computed at
+       the driver over the whole train batch (official semantics; v2a default).
+    2. Fallback: micro-batch-local selection via compute_opsa_selection (v1 behavior,
+       kept for ablation; with micro_bs=1 this degrades to a per-response 20% quota).
+    """
+    metrics: dict[str, Any] = {}
+    valid = response_mask
+    if self_distillation_mask is not None:
+        valid = valid * self_distillation_mask.unsqueeze(1)
+
+    if precomputed_advantages is not None and precomputed_mask is not None:
+        advantages = precomputed_advantages.detach()
+        sel = precomputed_mask.detach() * valid
+        metrics["opsa/selection_level"] = 1.0  # 1 = batch-level (driver)
+    else:
+        advantages, sel, sel_metrics = compute_opsa_selection(
+            log_prob, entropys, valid, self_distillation_config
+        )
+        metrics.update(sel_metrics)
+        metrics["opsa/selection_level"] = 0.0  # 0 = micro-batch-local (v1 fallback)
 
     # PPO clipped surrogate (slime ppo_utils.compute_policy_loss semantics). On-policy
     # single-mini-batch training has ratio == 1 (old_log_prob = log_prob.detach()),
@@ -1599,17 +1646,9 @@ def compute_opsa_loss(
     def _m(x, mask):
         return (verl_F.masked_sum(x, mask) / mask.sum().clamp(min=1.0)).detach().item()
 
-    metrics["opsa/selected_tokens"] = float(n_sel.detach().item())
-    metrics["opsa/selected_fraction"] = float(n_sel.detach().item()) / max(n_valid, 1)
-    metrics["opsa/advantage_mean"] = _m(advantages, sel)
+    metrics["opsa/micro_selected_tokens"] = float(sel.sum().detach().item())
     metrics["opsa/clipfrac"] = _m((pg_losses2 > pg_losses1).float().detach(), sel)
-    metrics["opsa/sel_logp_mean"] = _m(log_prob.detach(), sel)
-    if mode == "entropy" and entropys is not None and n_valid > 0:
-        sel_ent_stats = entropys.detach().float().reshape(-1)[sel_idx]
-        metrics["opsa/sel_entropy_mean"] = float(sel_ent_stats.mean().item())
-        metrics["opsa/sel_entropy_max"] = float(sel_ent_stats.max().item())
-        metrics["opsa/sel_entropy_min"] = float(sel_ent_stats.min().item())
-    metrics["self_distillation/num_distill_tokens"] = float(n_sel.detach().item())
+    metrics["self_distillation/num_distill_tokens"] = float(sel.sum().detach().item())
     return loss, metrics
 
 
