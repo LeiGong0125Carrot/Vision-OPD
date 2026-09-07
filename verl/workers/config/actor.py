@@ -114,6 +114,39 @@ class SelfDistillationConfig(BaseConfig):
     )
     fallback_to_policy_loss_on_missing_teacher: bool = False
     log_prob_dump_dir: Optional[str] = None
+    # --- State-Adaptive OPD-Aha (TreeVGR/09_01_plan.md) ---
+    # Frozen teacher does a second forward on the student's own (full-image) inputs to get
+    # a reference distribution p^F; the target is reconstructed along u = log p^H - log p^F
+    # with a per-token KL budget driven by the excess-effect gate. No labels are used anywhere.
+    state_adaptive: bool = False
+    sa_lambda: float = 1.0  # weight of D_JS(H,S) inside e_t = D_JS(H,F) - lambda * D_JS(H,S)
+    sa_tau_e: float = 0.03  # gate threshold on e_t
+    sa_temp_e: float = 0.015  # gate temperature T_e
+    sa_rho: float = 0.9  # re-entry window decay: g_t = max(g_raw_t, rho * g_{t-1})
+    sa_eps_max: float = 0.5  # max KL(q || p^H) budget in nats
+    sa_beta_max: float = 8.0  # binary-search upper bound for beta_t
+    sa_binary_iters: int = 8  # binary-search iterations
+    # --- v2 fixes (u-decomposition probe, 2026-09-03) ---
+    # zero_floor: rescale the gate so g=0 exactly at e_t=0 (kills the sigma(-tau/T) floor that
+    # kept a constant style push online at every token). center_u: subtract the per-sequence,
+    # per-token-type, p^H-weighted mean of u before reconstruction — removes the DC channels
+    # (EOS inflation, crop-register vocabulary, scene-content suppression) while keeping
+    # position-specific evidence spikes.
+    sa_zero_floor: bool = False
+    sa_center_u: bool = False
+    sa_u_clip: Optional[float] = None  # clamp |u| to guard junk-token amplification
+    # --- EVT: Evidence-Vetted Tail update (09_03_method_v2 §4B) ---
+    # Advantage-form distillation on the student's lowest-logp tokens, signed by the
+    # EMA-debiased evidence residual clip(u - ubar[token], -neg, +pos). Needs only the
+    # realized-token logps of the two teacher forwards (no top-k machinery).
+    evt_enable: bool = False
+    evt_token_fraction: float = 0.2
+    evt_clip_neg: float = 2.0
+    evt_clip_pos: float = 1.0
+    evt_ema_eta: float = 0.05
+    evt_neutral_base: float = 0.0
+    evt_ubar_init: Optional[str] = None  # json {token_id: ubar} warm start (probe snapshot)
+    evt_negative_only: bool = False  # EVT-neg: advantage=min(u_tilde,0) — gems pardoned, never boosted
 
     def __post_init__(self):
         if not 0.0 <= self.alpha <= 1.0:
@@ -141,6 +174,25 @@ class SelfDistillationConfig(BaseConfig):
             )
         if self.is_clip is not None and self.is_clip <= 0:
             raise ValueError(f"self_distillation.is_clip must be positive, got {self.is_clip}")
+        if self.state_adaptive:
+            if not self.full_logit_distillation or self.distillation_topk is None or not self.distillation_add_tail:
+                raise ValueError(
+                    "self_distillation.state_adaptive requires full_logit_distillation=True, "
+                    "distillation_topk set, and distillation_add_tail=True (top-k + tail support)."
+                )
+            if not 0.0 <= self.sa_rho < 1.0:
+                raise ValueError(f"self_distillation.sa_rho must be in [0,1), got {self.sa_rho}")
+            if self.sa_eps_max <= 0 or self.sa_beta_max <= 0 or self.sa_temp_e <= 0:
+                raise ValueError("self_distillation sa_eps_max, sa_beta_max, sa_temp_e must be positive.")
+        if self.evt_enable:
+            if self.state_adaptive:
+                raise ValueError("evt_enable and state_adaptive are mutually exclusive.")
+            if not 0.0 < self.evt_token_fraction <= 1.0:
+                raise ValueError(f"evt_token_fraction must be in (0,1], got {self.evt_token_fraction}")
+            if self.evt_clip_neg <= 0 or self.evt_clip_pos <= 0:
+                raise ValueError("evt_clip_neg/evt_clip_pos must be positive magnitudes.")
+            if not 0.0 < self.evt_ema_eta <= 1.0:
+                raise ValueError(f"evt_ema_eta must be in (0,1], got {self.evt_ema_eta}")
         if self.teacher_prompt_mode is not None and self.teacher_prompt_mode != "answer_hint":
             raise ValueError(
                 f"self_distillation.teacher_prompt_mode must be None or 'answer_hint', got {self.teacher_prompt_mode}"

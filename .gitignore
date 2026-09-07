@@ -1,0 +1,20 @@
+
+# ---- 实验产物 / 大文件 (v0-improvement) ----
+.claude/
+checkpoints/
+merged/
+rollouts/
+outputs/
+tensorboard_log/
+wandb/
+data/
+HiDe/
+TreeVGR/*/
+eval/model_answer/
+eval/judge/
+eval/VStar_images/
+eval/vstar_data/
+eval/treebench_probe/vstar_hide_preview/
+eval/treebench_probe/*.jsonl
+__pycache__/
+*.egg-info/

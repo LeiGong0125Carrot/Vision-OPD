@@ -20,6 +20,7 @@ implement PPO-like algorithms.
 
 __all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
 
+import math
 from collections import defaultdict
 from enum import Enum
 from typing import Any, Callable, Optional
@@ -1207,6 +1208,312 @@ def compute_self_distillation_loss(
         global_batch_size=global_batch_size,
         loss_scale_factor=loss_scale_factor,
     )
+    return loss, metrics
+
+
+def _sa_add_tail_log_probs(log_probs: torch.Tensor) -> torch.Tensor:
+    """Append a tail bucket so the top-k support becomes a proper distribution."""
+    log_s = torch.logsumexp(log_probs, dim=-1, keepdim=True)
+    log_s = torch.clamp(log_s, max=-1e-7)
+    tail_log = torch.log(-torch.expm1(log_s))
+    return torch.cat([log_probs, tail_log], dim=-1)
+
+
+def _sa_js_divergence(log_p: torch.Tensor, log_q: torch.Tensor) -> torch.Tensor:
+    """Jensen-Shannon divergence between two log-space distributions over the last dim. [.., K] -> [..]"""
+    log_m = torch.logsumexp(torch.stack([log_p, log_q]), dim=0) - math.log(2.0)
+    kl_pm = (log_p.exp() * (log_p - log_m)).sum(-1)
+    kl_qm = (log_q.exp() * (log_q - log_m)).sum(-1)
+    return 0.5 * (kl_pm + kl_qm)
+
+
+def _sa_reentry_scan(g_raw: torch.Tensor, rho: float) -> torch.Tensor:
+    """g_t = max(g_raw_t, rho * g_{t-1}) along dim=1, vectorized as a log-domain cummax.
+
+    g_t = max_{s<=t} rho^{t-s} g_raw_s = exp(t*log(rho) + cummax_s(log(g_raw_s) - s*log(rho))).
+    """
+    if rho <= 0.0:
+        return g_raw
+    log_rho = math.log(rho)
+    t_idx = torch.arange(g_raw.shape[1], device=g_raw.device, dtype=torch.float32)
+    shifted = torch.log(g_raw.clamp_min(1e-20)) - t_idx.unsqueeze(0) * log_rho
+    running_max = torch.cummax(shifted, dim=1).values
+    return torch.exp(running_max + t_idx.unsqueeze(0) * log_rho).clamp(max=1.0)
+
+
+def _sa_center_u_per_token_type(
+    u: torch.Tensor, weights: torch.Tensor, token_ids: torch.Tensor, loss_mask: torch.Tensor
+) -> torch.Tensor:
+    """Subtract the per-sequence, per-token-type weighted mean of u.
+
+    u/weights: [B,T,K+1] (last slot = tail bucket); token_ids: [B,T,K] vocab ids of the top-k
+    support. The tail bucket is treated as one pseudo token type. Style/DC channels (a token
+    pushed the same way at every position) collapse to ~0; position-specific spikes survive.
+    """
+    B, T, K1 = u.shape
+    K = K1 - 1
+    out = torch.empty_like(u)
+    for b in range(B):
+        m = loss_mask[b].bool()
+        ids = torch.where(
+            m.unsqueeze(-1).expand(T, K1),
+            torch.cat([token_ids[b], torch.full((T, 1), token_ids.max().item() + 1,
+                                                dtype=token_ids.dtype, device=token_ids.device)], dim=-1),
+            torch.zeros(T, K1, dtype=token_ids.dtype, device=token_ids.device),
+        ).reshape(-1)
+        w = (weights[b] * m.unsqueeze(-1)).reshape(-1)
+        uv = u[b].reshape(-1)
+        n_bins = int(ids.max().item()) + 1
+        wsum = torch.zeros(n_bins, dtype=u.dtype, device=u.device).scatter_add_(0, ids, w * uv)
+        wcnt = torch.zeros(n_bins, dtype=u.dtype, device=u.device).scatter_add_(0, ids, w)
+        ubar = wsum / wcnt.clamp_min(1e-8)
+        out[b] = (uv - ubar.gather(0, ids)).reshape(T, K1)
+    return out
+
+
+def compute_state_adaptive_distillation_loss(
+    student_log_probs: torch.Tensor,
+    student_topk_log_probs: torch.Tensor,
+    teacher_topk_log_probs: torch.Tensor,
+    teacher_full_topk_log_probs: torch.Tensor,
+    response_mask: torch.Tensor,
+    self_distillation_config: Any,
+    student_topk_indices: Optional[torch.Tensor] = None,
+    old_log_probs: Optional[torch.Tensor] = None,
+    self_distillation_mask: Optional[torch.Tensor] = None,
+    loss_agg_mode: str = "token-mean",
+    rollout_is_weights: Optional[torch.Tensor] = None,
+    batch_num_tokens: Optional[int] = None,
+    global_batch_size: Optional[int] = None,
+    loss_scale_factor: Optional[int] = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """State-Adaptive OPD-Aha loss (TreeVGR/09_01_plan.md, v1: no sharpening modifier).
+
+    All three distributions share the student's top-k support plus a tail bucket:
+      p^S: trainable student on the full image; p^H: frozen teacher on the privileged view;
+      p^F: same frozen teacher on the student's full-image inputs.
+    Per token: e_t = [D_JS(H,F) - lambda * D_JS(H,S)]_+, g_raw = sigmoid((e_t - tau_e)/T_e),
+    g_t = max(g_raw_t, rho * g_{t-1}), eps_t = eps_max * g_t, beta_t solved by binary search
+    so that KL(q_t || p^H) <= eps_t with q_t = softmax(log p^H + beta_t (log p^H - log p^F)),
+    and the loss is the generalized JSD (config alpha) between p^S and q_t.
+    """
+    cfg = self_distillation_config
+    metrics: dict[str, Any] = {}
+
+    loss_mask = response_mask
+    if self_distillation_mask is not None:
+        loss_mask = loss_mask * self_distillation_mask.unsqueeze(1)
+
+    log_s = _sa_add_tail_log_probs(student_topk_log_probs)
+    log_h = _sa_add_tail_log_probs(teacher_topk_log_probs)
+    log_f = _sa_add_tail_log_probs(teacher_full_topk_log_probs)
+
+    with torch.no_grad():
+        log_s_d = log_s.detach()
+        js_hf = _sa_js_divergence(log_h, log_f)
+        js_hs = _sa_js_divergence(log_h, log_s_d)
+        e_t = torch.relu(js_hf - cfg.sa_lambda * js_hs)
+        g_raw = torch.sigmoid((e_t - cfg.sa_tau_e) / cfg.sa_temp_e)
+        if cfg.get("sa_zero_floor", False):
+            # rescale so g=0 exactly at e_t=0: no residual budget at closed gate
+            floor = torch.sigmoid(torch.tensor(-cfg.sa_tau_e / cfg.sa_temp_e, device=g_raw.device))
+            g_raw = torch.relu(g_raw - floor) / (1.0 - floor)
+        g_raw = g_raw * loss_mask
+        gate = _sa_reentry_scan(g_raw, cfg.sa_rho)
+        eps_t = cfg.sa_eps_max * gate
+
+        u_t = log_h - log_f
+        if cfg.get("sa_center_u", False):
+            if student_topk_indices is None:
+                raise ValueError("sa_center_u requires student_topk_indices.")
+            u_t = _sa_center_u_per_token_type(u_t, log_h.exp(), student_topk_indices, loss_mask)
+        u_clip = cfg.get("sa_u_clip", None)
+        if u_clip is not None:
+            # guard against exponential amplification of junk tokens: a token with tiny p^H but
+            # extreme u gains e^(beta*u) in q — clip the residual direction to a sane range.
+            u_t = u_t.clamp(min=-float(u_clip), max=float(u_clip))
+        beta_lo = torch.zeros_like(eps_t)
+        beta_hi = torch.full_like(eps_t, cfg.sa_beta_max)
+        for _ in range(int(cfg.sa_binary_iters)):
+            beta_mid = 0.5 * (beta_lo + beta_hi)
+            log_q_mid = torch.log_softmax(log_h + beta_mid.unsqueeze(-1) * u_t, dim=-1)
+            kl_qh = (log_q_mid.exp() * (log_q_mid - log_h)).sum(-1)
+            within = kl_qh <= eps_t
+            beta_lo = torch.where(within, beta_mid, beta_lo)
+            beta_hi = torch.where(within, beta_hi, beta_mid)
+        beta_t = beta_lo
+        log_q = torch.log_softmax(log_h + beta_t.unsqueeze(-1) * u_t, dim=-1)
+        kl_q_h = (log_q.exp() * (log_q - log_h)).sum(-1)
+
+    alpha = cfg.alpha
+    if alpha == 0.0:
+        kl_loss = F.kl_div(log_s, log_q, reduction="none", log_target=True)
+    elif alpha == 1.0:
+        kl_loss = F.kl_div(log_q, log_s, reduction="none", log_target=True)
+    else:
+        alpha_t = torch.tensor(alpha, dtype=log_s.dtype, device=log_s.device)
+        mixture_log_probs = torch.logsumexp(
+            torch.stack([log_s + torch.log(1 - alpha_t), log_q + torch.log(alpha_t)]),
+            dim=0,
+        )
+        kl_teacher = F.kl_div(mixture_log_probs, log_q, reduction="none", log_target=True)
+        kl_student = F.kl_div(mixture_log_probs, log_s, reduction="none", log_target=True)
+        kl_loss = torch.lerp(kl_student, kl_teacher, alpha)
+
+    raw_per_token_loss = kl_loss.sum(-1)
+    weighted_per_token_loss = raw_per_token_loss
+
+    is_clip = cfg.is_clip
+    if is_clip is not None:
+        if old_log_probs is None:
+            raise ValueError("old_log_probs is required for distillation IS ratio.")
+        negative_approx_kl = (student_log_probs - old_log_probs).detach()
+        negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
+        ratio = torch.exp(negative_approx_kl).clamp(max=is_clip)
+        weighted_per_token_loss = weighted_per_token_loss * ratio
+
+    if rollout_is_weights is not None:
+        weighted_per_token_loss = weighted_per_token_loss * rollout_is_weights
+
+    valid_token_count = loss_mask.sum().clamp(min=1.0)
+    if batch_num_tokens is None:
+        batch_num_tokens = valid_token_count
+
+    def _masked_mean(x: torch.Tensor) -> float:
+        return (verl_F.masked_sum(x, loss_mask) / valid_token_count).detach().item()
+
+    metrics["state_adaptive/e_t_mean"] = _masked_mean(e_t)
+    metrics["state_adaptive/js_hf_mean"] = _masked_mean(js_hf)
+    metrics["state_adaptive/js_hs_mean"] = _masked_mean(js_hs)
+    metrics["state_adaptive/gate_mean"] = _masked_mean(gate)
+    metrics["state_adaptive/gate_raw_mean"] = _masked_mean(g_raw)
+    metrics["state_adaptive/gate_frac_open"] = _masked_mean((gate > 0.5).float())
+    metrics["state_adaptive/beta_mean"] = _masked_mean(beta_t)
+    metrics["state_adaptive/eps_mean"] = _masked_mean(eps_t)
+    metrics["state_adaptive/kl_q_h_mean"] = _masked_mean(kl_q_h)
+    metrics["self_distillation/raw_jsd_token_mean"] = _masked_mean(raw_per_token_loss)
+    metrics["self_distillation/weighted_jsd_token_mean"] = _masked_mean(weighted_per_token_loss)
+    if self_distillation_mask is None:
+        metrics["self_distillation/self_distillation_mask.mean()"] = 1.0
+    else:
+        metrics["self_distillation/self_distillation_mask.mean()"] = self_distillation_mask.float().mean().detach().item()
+    metrics["self_distillation/num_distill_tokens"] = loss_mask.sum().detach().item()
+
+    loss = agg_loss(
+        loss_mat=weighted_per_token_loss,
+        loss_mask=loss_mask,
+        loss_agg_mode=loss_agg_mode,
+        batch_num_tokens=batch_num_tokens,
+        global_batch_size=global_batch_size,
+        loss_scale_factor=loss_scale_factor,
+    )
+    return loss, metrics
+
+
+def compute_evt_loss(
+    student_log_probs: torch.Tensor,
+    teacher_log_probs: torch.Tensor,
+    teacher_full_log_probs: torch.Tensor,
+    response_ids: torch.Tensor,
+    response_mask: torch.Tensor,
+    self_distillation_config: Any,
+    ubar_table: torch.Tensor,
+    ubar_seen: torch.Tensor,
+    old_log_probs: Optional[torch.Tensor] = None,
+    self_distillation_mask: Optional[torch.Tensor] = None,
+    rollout_is_weights: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Evidence-Vetted Tail update (TreeVGR/09_03_method_v2.md §4B).
+
+    Advantage-form privileged distillation restricted to the student's lowest-logp tokens
+    (OPSA's tail law), with the advantage signed by the debiased evidence residual
+    u_tilde = clip(u - ubar[token], -clip_neg, +clip_pos), u = log p^H - log p^F on the
+    realized token. ubar is a corpus-level EMA per token type (per-sequence centering would
+    self-cancel singleton content words). The table is read before, updated after, so the
+    current step's advantage never subtracts itself. Minimal pair with OPSA: same selection
+    semantics (batch-level lowest fraction, official compute_opsa convention), advantage
+    source swapped from fixed negative to evidence sign. No labels anywhere.
+    """
+    cfg = self_distillation_config
+    metrics: dict[str, Any] = {}
+    frac = cfg.get("evt_token_fraction", 0.2)
+    clip_neg = float(cfg.get("evt_clip_neg", 2.0))
+    clip_pos = float(cfg.get("evt_clip_pos", 1.0))
+    eta = float(cfg.get("evt_ema_eta", 0.05))
+    neutral_base = float(cfg.get("evt_neutral_base", 0.0))
+
+    valid = response_mask
+    if self_distillation_mask is not None:
+        valid = valid * self_distillation_mask.unsqueeze(1)
+    valid_b = valid > 0.5
+
+    with torch.no_grad():
+        u = (teacher_log_probs - teacher_full_log_probs).float()
+        ids = response_ids.clamp(min=0, max=ubar_table.numel() - 1)
+        seen = ubar_seen.gather(0, ids.reshape(-1)).reshape_as(ids)
+        ubar_vals = ubar_table.gather(0, ids.reshape(-1)).reshape_as(ids).float()
+        batch_mean_u = (u * valid).sum() / valid.sum().clamp(min=1.0)
+        ubar_used = torch.where(seen, ubar_vals, batch_mean_u)  # 未见词退回全局DC估计
+        u_tilde_raw = u - ubar_used
+        u_tilde = u_tilde_raw.clamp(min=-clip_neg, max=clip_pos)
+        advantage = u_tilde
+        if cfg.get("evt_negative_only", False):
+            # EVT-neg (证据否决的压制): 正优势在采样 token 的 PG 形式下是自增强回路,
+            # 会放大采样噪声直至策略坍缩 (EVT v1 实测 + OPSA 论文的 +0.2 崩溃对照)。
+            # 明珠 (u_tilde>0) 不抬只赦免 (优势=0, 零梯度), 共识垃圾照压。
+            advantage = u_tilde.clamp(max=0.0)
+        if neutral_base != 0.0:
+            advantage = advantage - neutral_base * ((u_tilde.abs() <= 1.0).float())
+
+        # 官方 compute_opsa 语义: batch 级 lowest-fraction 选择, 以当前学生 logp 排序
+        flat_lp = student_log_probs.detach().reshape(-1)
+        flat_valid = valid_b.reshape(-1)
+        sel_mask = torch.zeros_like(flat_lp)
+        n_valid = int(flat_valid.sum())
+        if n_valid > 0:
+            k = max(1, int(frac * n_valid))
+            vidx = torch.nonzero(flat_valid, as_tuple=False).flatten()
+            order = torch.argsort(flat_lp[vidx], stable=True)
+            sel_mask[vidx[order[:k]]] = 1.0
+        sel = sel_mask.reshape_as(student_log_probs)
+
+        # EMA 更新 (选前表已读完, 此处安全): 逐词批内均值 -> 表
+        flat_ids = ids.reshape(-1)[flat_valid]
+        flat_u = u.reshape(-1)[flat_valid]
+        if flat_ids.numel() > 0:
+            sums = torch.zeros_like(ubar_table).scatter_add_(0, flat_ids, flat_u)
+            cnts = torch.zeros_like(ubar_table).scatter_add_(0, flat_ids, torch.ones_like(flat_u))
+            got = cnts > 0
+            bmean = sums[got] / cnts[got]
+            old_seen = ubar_seen[got]
+            ubar_table[got] = torch.where(old_seen, (1 - eta) * ubar_table[got] + eta * bmean, bmean)
+            ubar_seen[got] = True
+
+    per_token_loss = -advantage * student_log_probs
+    is_clip = cfg.get("is_clip", None)
+    if is_clip is not None:
+        if old_log_probs is None:
+            raise ValueError("old_log_probs is required for EVT IS ratio.")
+        ratio = torch.exp((student_log_probs - old_log_probs).detach().clamp(-20.0, 20.0)).clamp(max=is_clip)
+        per_token_loss = per_token_loss * ratio
+    if rollout_is_weights is not None:
+        per_token_loss = per_token_loss * rollout_is_weights
+
+    n_sel = sel.sum().clamp(min=1.0)
+    loss = (per_token_loss * sel).sum() / n_sel
+
+    def _m(x, mask):
+        return (verl_F.masked_sum(x, mask) / mask.sum().clamp(min=1.0)).detach().item()
+
+    metrics["evt/selected_tokens"] = float(n_sel.detach().item())
+    metrics["evt/selected_fraction"] = float((n_sel / max(n_valid, 1)).detach().item())
+    metrics["evt/adv_mean_sel"] = _m(advantage, sel)
+    metrics["evt/adv_pos_frac_sel"] = _m((advantage > 0).float(), sel)
+    metrics["evt/gems_frac_sel"] = _m((u_tilde_raw > 1.0).float(), sel)
+    metrics["evt/u_raw_mean"] = _m(u, valid)
+    metrics["evt/u_tilde_mean"] = _m(u_tilde, valid)
+    metrics["evt/ubar_coverage"] = _m(seen.float(), valid)
+    metrics["self_distillation/num_distill_tokens"] = float(n_sel.detach().item())
     return loss, metrics
 
 

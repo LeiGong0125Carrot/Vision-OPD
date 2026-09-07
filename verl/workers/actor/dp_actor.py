@@ -30,7 +30,14 @@ from torch.distributed.tensor import DTensor
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, compute_self_distillation_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.core_algos import (
+    agg_loss,
+    compute_evt_loss,
+    compute_self_distillation_loss,
+    compute_state_adaptive_distillation_loss,
+    get_policy_loss_fn,
+    kl_penalty,
+)
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -925,6 +932,7 @@ class DataParallelPPOActor(BasePPOActor):
             stage_wall_time_totals = {
                 "timing_s/update_actor/student_forward": 0.0,
                 "timing_s/update_actor/teacher_forward": 0.0,
+                "timing_s/update_actor/teacher_full_forward": 0.0,
                 "timing_s/update_actor/loss_compute": 0.0,
                 "timing_s/update_actor/backward": 0.0,
                 "timing_s/update_actor/optimizer_step": 0.0,
@@ -1040,6 +1048,42 @@ class DataParallelPPOActor(BasePPOActor):
                         teacher_log_prob = teacher_outputs["log_probs"]
                         teacher_all_logps = teacher_outputs.get("all_logps") if return_all_logps else None
                         teacher_topk_logps = teacher_outputs.get("topk_logps") if distill_topk else None
+
+                        state_adaptive = self_distillation_cfg.get("state_adaptive", False)
+                        evt_enable = self_distillation_cfg.get("evt_enable", False)
+                        teacher_full_topk_logps = None
+                        if state_adaptive or evt_enable:
+                            if state_adaptive and student_topk_indices is None:
+                                raise ValueError("state_adaptive requires distillation_topk (student top-k support).")
+                            if self.teacher_module is None or self.teacher_module is self.actor_module:
+                                raise ValueError(
+                                    "state_adaptive/evt requires a separate frozen teacher_module for the "
+                                    "full-image reference forward."
+                                )
+                            # Reference view p^F: the same frozen teacher forwarded on the student's own
+                            # (full-image) inputs, gathered on the student's top-k support.
+                            with torch.no_grad():
+                                teacher_full_forward_start = time.perf_counter()
+                                teacher_full_outputs = self._forward_micro_batch(
+                                    model_inputs,
+                                    temperature=temperature,
+                                    calculate_entropy=False,
+                                    return_all_logps=False,
+                                    distill_topk=distill_topk,
+                                    topk_indices=student_topk_indices,
+                                    module=teacher_model,
+                                )
+                                teacher_full_forward_time = time.perf_counter() - teacher_full_forward_start
+                            stage_wall_time_totals["timing_s/update_actor/teacher_full_forward"] += (
+                                teacher_full_forward_time
+                            )
+                            teacher_full_topk_logps = teacher_full_outputs.get("topk_logps")
+                            # 漂移诊断: 实际 token 上 H−F 的每 token 似然差 (探针主读数的训练时版本;
+                            # 起点应 ≈-0.36, 上穿 0 = 学生被拖进 crop 教师偏好盆地的警报)
+                            _dlp = (teacher_outputs["log_probs"] - teacher_full_outputs["log_probs"]).detach()
+                            micro_batch_metrics["state_adaptive/dlogp_tok_hf"] = (
+                                (_dlp * response_mask).sum() / response_mask.sum().clamp(min=1.0)
+                            ).item()
                         if self_distillation_cfg.get("log_prob_dump_dir", None):
                             if distill_topk:
                                 student_distill_log_probs = student_topk_logps
@@ -1066,23 +1110,71 @@ class DataParallelPPOActor(BasePPOActor):
                                     }
                                 )
                         loss_compute_start = time.perf_counter()
-                        vopd_loss, vopd_metrics = compute_self_distillation_loss(
-                            student_log_probs=log_prob,
-                            teacher_log_probs=teacher_log_prob,
-                            response_mask=response_mask,
-                            self_distillation_config=self_distillation_cfg,
-                            old_log_probs=old_log_prob,
-                            student_all_log_probs=student_all_logps,
-                            teacher_all_log_probs=teacher_all_logps,
-                            student_topk_log_probs=student_topk_logps,
-                            teacher_topk_log_probs=teacher_topk_logps,
-                            self_distillation_mask=self_distillation_mask,
-                            loss_agg_mode=loss_agg_mode,
-                            rollout_is_weights=rollout_is_weights,
-                            batch_num_tokens=self.config.global_batch_info.get("batch_num_tokens"),
-                            global_batch_size=self.config.global_batch_info.get("global_batch_size"),
-                            loss_scale_factor=self.config.global_batch_info.get("loss_scale_factor"),
-                        )
+                        if evt_enable:
+                            if not hasattr(self, "evt_ubar"):
+                                vocab_guess = 160000
+                                self.evt_ubar = torch.zeros(vocab_guess, dtype=torch.float32,
+                                                            device=log_prob.device)
+                                self.evt_seen = torch.zeros(vocab_guess, dtype=torch.bool,
+                                                            device=log_prob.device)
+                                init_path = self_distillation_cfg.get("evt_ubar_init", None)
+                                if init_path:
+                                    import json as _json
+                                    warm = _json.load(open(init_path))
+                                    for k, v in warm.items():
+                                        i = int(k)
+                                        if i < vocab_guess:
+                                            self.evt_ubar[i] = float(v)
+                                            self.evt_seen[i] = True
+                                    print(f"[EVT] ubar warm start: {len(warm)} token types from {init_path}")
+                            vopd_loss, vopd_metrics = compute_evt_loss(
+                                student_log_probs=log_prob,
+                                teacher_log_probs=teacher_log_prob,
+                                teacher_full_log_probs=teacher_full_outputs["log_probs"],
+                                response_ids=model_inputs["responses"],
+                                response_mask=response_mask,
+                                self_distillation_config=self_distillation_cfg,
+                                ubar_table=self.evt_ubar,
+                                ubar_seen=self.evt_seen,
+                                old_log_probs=old_log_prob,
+                                self_distillation_mask=self_distillation_mask,
+                                rollout_is_weights=rollout_is_weights,
+                            )
+                        elif state_adaptive:
+                            vopd_loss, vopd_metrics = compute_state_adaptive_distillation_loss(
+                                student_log_probs=log_prob,
+                                student_topk_log_probs=student_topk_logps,
+                                teacher_topk_log_probs=teacher_topk_logps,
+                                teacher_full_topk_log_probs=teacher_full_topk_logps,
+                                student_topk_indices=student_topk_indices,
+                                response_mask=response_mask,
+                                self_distillation_config=self_distillation_cfg,
+                                old_log_probs=old_log_prob,
+                                self_distillation_mask=self_distillation_mask,
+                                loss_agg_mode=loss_agg_mode,
+                                rollout_is_weights=rollout_is_weights,
+                                batch_num_tokens=self.config.global_batch_info.get("batch_num_tokens"),
+                                global_batch_size=self.config.global_batch_info.get("global_batch_size"),
+                                loss_scale_factor=self.config.global_batch_info.get("loss_scale_factor"),
+                            )
+                        else:
+                            vopd_loss, vopd_metrics = compute_self_distillation_loss(
+                                student_log_probs=log_prob,
+                                teacher_log_probs=teacher_log_prob,
+                                response_mask=response_mask,
+                                self_distillation_config=self_distillation_cfg,
+                                old_log_probs=old_log_prob,
+                                student_all_log_probs=student_all_logps,
+                                teacher_all_log_probs=teacher_all_logps,
+                                student_topk_log_probs=student_topk_logps,
+                                teacher_topk_log_probs=teacher_topk_logps,
+                                self_distillation_mask=self_distillation_mask,
+                                loss_agg_mode=loss_agg_mode,
+                                rollout_is_weights=rollout_is_weights,
+                                batch_num_tokens=self.config.global_batch_info.get("batch_num_tokens"),
+                                global_batch_size=self.config.global_batch_info.get("global_batch_size"),
+                                loss_scale_factor=self.config.global_batch_info.get("loss_scale_factor"),
+                            )
                         loss_compute_time = time.perf_counter() - loss_compute_start
                         stage_wall_time_totals["timing_s/update_actor/loss_compute"] += loss_compute_time
 

@@ -160,6 +160,59 @@ self_distillation:
   # Optional directory for dumping per-step student/teacher distillation log-probs
   log_prob_dump_dir: null
 
+  # --- State-Adaptive OPD-Aha (TreeVGR/09_01_plan.md, v1: no sharpening modifier) ---
+  # Frozen teacher does a second forward on the student's own full-image inputs (p^F);
+  # target reconstructed along u = log p^H - log p^F under a per-token KL budget.
+  state_adaptive: False
+
+  # Weight of D_JS(H,S) inside e_t = D_JS(H,F) - lambda * D_JS(H,S)
+  sa_lambda: 1.0
+
+  # Excess-effect gate threshold and temperature: g_raw = sigmoid((e_t - sa_tau_e) / sa_temp_e)
+  sa_tau_e: 0.03
+  sa_temp_e: 0.015
+
+  # Re-entry window decay: g_t = max(g_raw_t, sa_rho * g_{t-1})
+  sa_rho: 0.9
+
+  # Max per-token KL(q || p^H) budget in nats: eps_t = sa_eps_max * g_t
+  sa_eps_max: 0.5
+
+  # Binary-search upper bound and iterations for beta_t
+  sa_beta_max: 8.0
+  sa_binary_iters: 8
+
+  # v2 fixes: zero the gate floor (g=0 exactly at e_t=0); center u per token type
+  # (p^H-weighted, per sequence) to remove DC/style channels before reconstruction
+  sa_zero_floor: False
+  sa_center_u: False
+
+  # Clamp |u| after centering (null disables); guards junk-token exponential amplification
+  sa_u_clip: null
+
+  # EVT: advantage-form distillation on the student's lowest-logp tokens,
+  # signed by the EMA-debiased evidence residual (09_03_method_v2 §4B)
+  evt_enable: False
+
+  # Fraction of valid response tokens selected (batch-level, official OPSA convention)
+  evt_token_fraction: 0.2
+
+  # Asymmetric clip magnitudes for the debiased residual: [-neg, +pos]
+  evt_clip_neg: 2.0
+  evt_clip_pos: 1.0
+
+  # EMA rate for the per-token-type debias table
+  evt_ema_eta: 0.05
+
+  # Optional extra negative base applied in the neutral zone |u_tilde|<=1 (OPSA-hygiene ablation)
+  evt_neutral_base: 0.0
+
+  # Optional json {token_id: ubar} to warm-start the debias table
+  evt_ubar_init: null
+
+  # EVT-neg: negative-only advantage (min(u_tilde,0)); gems pardoned from suppression, never boosted
+  evt_negative_only: False
+
   # IS clip for loss; null disables IS weighting
   is_clip: 2
 
