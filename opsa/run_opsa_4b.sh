@@ -36,9 +36,16 @@ OPSA_ADV_MAX=${OPSA_ADV_MAX:--0.5}
 OPSA_FIXED_ADV=${OPSA_FIXED_ADV:-null}
 
 ROLLOUT_TENSOR_MODEL_PARALLEL_SIZE=1
+# --- think 模式 (官方设定): 不传自定义模板 -> 模型自带官方模板默认 think 开
+# (预填 '<think>\n'); 自定义模板已验证 ≡ 官方 enable_thinking=False, 故这是单变量切换 ---
+THINK_MODE=${THINK_MODE:-False}
 # --- 6K armA 高清配置 (Arm A 先例) ---
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-8192}
-MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-2048} # 给 response 变长机制留空间 (原 1024)
+if [[ "$THINK_MODE" == "True" ]]; then
+    MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-4096}  # think 块需要更长预算
+else
+    MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-2048}  # 给 response 变长机制留空间 (原 1024)
+fi
 TRAIN_MAX_MODEL_LEN=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-$TRAIN_MAX_MODEL_LEN}"
 ROLLOUT_GPU_MEMORY_UTILIZATION=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.7}
@@ -62,6 +69,9 @@ TRAINER_LOGGER=${TRAINER_LOGGER:-'["console","tensorboard"]'}
 ROLLOUT_AGENT_NUM_WORKERS=8
 DATA_DATALOADER_NUM_WORKERS=8
 CUSTOM_CHAT_TEMPLATE_FILE="${PROJECT_ROOT}/chat_templates/perception_chat_template_qwen35.jinja"
+if [[ "$THINK_MODE" == "True" ]]; then
+    CUSTOM_CHAT_TEMPLATE_FILE=""   # 官方模板, think 默认开
+fi
 
 TASK_TRAIN_FILE="${TASK_TRAIN_FILE:-${PROJECT_ROOT}/data/TreeVGR-RL-37K/train_6k_armA_hide.parquet}"
 
