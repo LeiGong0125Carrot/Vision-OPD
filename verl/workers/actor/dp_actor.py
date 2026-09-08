@@ -38,6 +38,7 @@ from verl.trainer.ppo.core_algos import (
     compute_state_adaptive_distillation_loss,
     get_policy_loss_fn,
     kl_penalty,
+    reconstruct_aha_target,
 )
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
@@ -878,6 +879,13 @@ class DataParallelPPOActor(BasePPOActor):
                     "teacher_response_start_idx",
                     "self_distillation_mask",
                 }
+                if self_distillation_cfg.get("aha_enable", False):
+                    self_distillation_required_keys |= {
+                        "null_input_ids",
+                        "null_attention_mask",
+                        "null_position_ids",
+                        "null_response_start_idx",
+                    }
                 assert self_distillation_required_keys.issubset(set(data.batch.keys())), f"Missing required keys: {self_distillation_required_keys - set(data.batch.keys())}"
 
         select_keys = [
@@ -917,6 +925,8 @@ class DataParallelPPOActor(BasePPOActor):
             non_tensor_select_keys.append("multi_modal_inputs")
         if has_teacher_multi_modal_inputs:
             non_tensor_select_keys.append("teacher_multi_modal_inputs")
+        if self._has_non_empty_multi_modal_inputs(data.non_tensor_batch.get("null_multi_modal_inputs")):
+            non_tensor_select_keys.append("null_multi_modal_inputs")
         if self.use_prefix_grouper and "uid" in data.non_tensor_batch.keys():
             non_tensor_select_keys.append("uid")
 
@@ -1123,6 +1133,57 @@ class DataParallelPPOActor(BasePPOActor):
                             _dlp = (teacher_outputs["log_probs"] - teacher_full_outputs["log_probs"]).detach()
                             micro_batch_metrics["state_adaptive/dlogp_tok_hf"] = (
                                 (_dlp * response_mask).sum() / response_mask.sum().clamp(min=1.0)
+                            ).item()
+                        aha_enable = self_distillation_cfg.get("aha_enable", False)
+                        if aha_enable:
+                            if student_topk_indices is None:
+                                raise ValueError("aha requires distillation_topk (student top-k support).")
+                            if self.teacher_module is None or self.teacher_module is self.actor_module:
+                                raise ValueError(
+                                    "aha requires a separate frozen teacher_module for the null-image forward."
+                                )
+                            # Null view p⁰: the same frozen teacher forwarded on the mean-RGB null-image
+                            # inputs, gathered on the student's top-k support (same semantics as p⁺).
+                            null_inputs = {
+                                "responses": model_inputs["responses"],
+                                "input_ids": model_inputs["null_input_ids"],
+                                "attention_mask": model_inputs["null_attention_mask"],
+                                "position_ids": model_inputs["null_position_ids"],
+                                "response_start_idx": model_inputs["null_response_start_idx"],
+                            }
+                            if "null_multi_modal_inputs" in model_inputs:
+                                null_inputs["multi_modal_inputs"] = model_inputs["null_multi_modal_inputs"]
+                            with torch.no_grad():
+                                teacher_null_forward_start = time.perf_counter()
+                                teacher_null_outputs = self._forward_micro_batch(
+                                    null_inputs,
+                                    temperature=temperature,
+                                    calculate_entropy=False,
+                                    return_all_logps=False,
+                                    distill_topk=distill_topk,
+                                    topk_indices=student_topk_indices,
+                                    module=teacher_model,
+                                )
+                                teacher_null_forward_time = time.perf_counter() - teacher_null_forward_start
+                            stage_wall_time_totals["timing_s/update_actor/teacher_null_forward"] += (
+                                teacher_null_forward_time
+                            )
+                            teacher_null_topk_logps = teacher_null_outputs.get("topk_logps")
+                            log_q_topk, aha_metrics = reconstruct_aha_target(
+                                teacher_topk_logps=teacher_topk_logps,
+                                teacher_null_topk_logps=teacher_null_topk_logps,
+                                beta=self_distillation_cfg.get("aha_beta", 4.0),
+                                floor_alpha=self_distillation_cfg.get("aha_floor_alpha", None),
+                                response_mask=response_mask,
+                            )
+                            # 重建 q 取代原始 teacher 分布, 之后走与 V0 完全相同的损失路径
+                            # (compute_self_distillation_loss, add_tail=True 补回尾桶)。
+                            teacher_topk_logps = log_q_topk.to(teacher_topk_logps.dtype)
+                            micro_batch_metrics.update(aha_metrics)
+                            # Ren Fig.4 挤压哨兵: 学生 top-1 概率均值
+                            _conf = student_topk_logps[..., 0].detach().exp()
+                            micro_batch_metrics["aha/argmax_conf"] = (
+                                (_conf * response_mask).sum() / response_mask.sum().clamp(min=1.0)
                             ).item()
                         if self_distillation_cfg.get("log_prob_dump_dir", None):
                             if distill_topk:

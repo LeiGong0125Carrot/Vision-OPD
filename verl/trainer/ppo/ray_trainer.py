@@ -1293,95 +1293,104 @@ class RayPPOTrainer:
                 raise KeyError(f"Teacher image key `{teacher_image_key}` not found in batch.non_tensor_batch")
             fallback_to_policy_loss = self_distillation_cfg.get("fallback_to_policy_loss_on_missing_teacher", False)
 
-            teacher_input_ids_list = []
-            teacher_attention_mask_list = []
-            teacher_position_ids_list = []
-            teacher_response_start_idx_list = []
-            teacher_multi_modal_inputs_list = []
-            teacher_present_mask_list = []
+            def build_side(image_key):
+                """按给定图像列构建一套 teacher 侧输入 (per-sample 构建 + padding)。"""
+                input_ids_list = []
+                attention_mask_list = []
+                position_ids_list = []
+                response_start_idx_list = []
+                multi_modal_inputs_list = []
+                present_mask_list = []
 
-            for i in range(batch_size):
-                self._raise_if_response_contains_visual_special_tokens(
-                    responses[i],
-                    response_mask[i],
-                    batch,
-                    i,
-                )
-                teacher_prompt_messages = None
-                if "teacher_prompt" in batch.non_tensor_batch:
-                    teacher_prompt_messages = list(batch.non_tensor_batch["teacher_prompt"][i])
+                for i in range(batch_size):
+                    self._raise_if_response_contains_visual_special_tokens(
+                        responses[i],
+                        response_mask[i],
+                        batch,
+                        i,
+                    )
+                    teacher_prompt_messages = None
+                    if "teacher_prompt" in batch.non_tensor_batch:
+                        teacher_prompt_messages = list(batch.non_tensor_batch["teacher_prompt"][i])
 
-                teacher_images = batch.non_tensor_batch[teacher_image_key][i]
-                if isinstance(teacher_images, np.ndarray):
-                    teacher_images = teacher_images.tolist()
-                elif teacher_images is None:
-                    teacher_images = []
+                    side_images = batch.non_tensor_batch[image_key][i]
+                    if isinstance(side_images, np.ndarray):
+                        side_images = side_images.tolist()
+                    elif side_images is None:
+                        side_images = []
+                    else:
+                        side_images = list(side_images)
+                    has_images = self._teacher_images_available(side_images)
+                    present_mask_list.append(1.0 if has_images else 0.0)
+                    if not has_images:
+                        if not fallback_to_policy_loss:
+                            raise ValueError(
+                                f"Teacher image key `{image_key}` is empty for sample {i}, "
+                                "but fallback_to_policy_loss_on_missing_teacher=False."
+                            )
+                        side_images = self._extract_images_from_messages(
+                            list(batch.non_tensor_batch["raw_prompt"][i]))
+
+                    teacher_messages = self._prepare_teacher_messages(
+                        list(batch.non_tensor_batch["raw_prompt"][i]),
+                        side_images,
+                        teacher_prompt_messages=teacher_prompt_messages,
+                    )
+                    (
+                        side_input_ids,
+                        side_attention_mask,
+                        side_position_ids,
+                        side_response_start_idx,
+                        side_multi_modal_inputs,
+                    ) = self._build_teacher_prompt_inputs(
+                        teacher_messages,
+                        responses[i],
+                        response_mask[i],
+                        max_prompt_len=self_distillation_cfg.max_reprompt_len,
+                    )
+                    input_ids_list.append(side_input_ids)
+                    attention_mask_list.append(side_attention_mask)
+                    position_ids_list.append(side_position_ids)
+                    response_start_idx_list.append(side_response_start_idx)
+                    multi_modal_inputs_list.append(side_multi_modal_inputs)
+
+                input_ids = torch.nn.utils.rnn.pad_sequence(
+                    input_ids_list, batch_first=True,
+                    padding_value=self.tokenizer.pad_token_id or 0,
+                ).to(device)
+                attention_mask = torch.nn.utils.rnn.pad_sequence(
+                    attention_mask_list, batch_first=True, padding_value=0,
+                ).to(device)
+
+                max_len = input_ids.shape[1]
+                if position_ids_list[0].dim() == 1:
+                    position_ids = torch.zeros(
+                        (batch_size, max_len),
+                        dtype=position_ids_list[0].dtype, device=device,
+                    )
+                    for i, pids in enumerate(position_ids_list):
+                        position_ids[i, : pids.shape[-1]] = pids.to(device)
                 else:
-                    teacher_images = list(teacher_images)
-                has_teacher_images = self._teacher_images_available(teacher_images)
-                teacher_present_mask_list.append(1.0 if has_teacher_images else 0.0)
-                if not has_teacher_images:
-                    if not fallback_to_policy_loss:
-                        raise ValueError(
-                            f"Teacher image key `{teacher_image_key}` is empty for sample {i}, "
-                            "but fallback_to_policy_loss_on_missing_teacher=False."
-                        )
-                    teacher_images = self._extract_images_from_messages(list(batch.non_tensor_batch["raw_prompt"][i]))
+                    rope_dims = position_ids_list[0].shape[0]
+                    position_ids = torch.zeros(
+                        (batch_size, rope_dims, max_len),
+                        dtype=position_ids_list[0].dtype, device=device,
+                    )
+                    for i, pids in enumerate(position_ids_list):
+                        position_ids[i, :, : pids.shape[-1]] = pids.to(device)
 
-                teacher_messages = self._prepare_teacher_messages(
-                    list(batch.non_tensor_batch["raw_prompt"][i]),
-                    teacher_images,
-                    teacher_prompt_messages=teacher_prompt_messages,
-                )
-                (
-                    teacher_input_ids,
-                    teacher_attention_mask,
-                    teacher_position_ids,
-                    teacher_response_start_idx,
-                    teacher_multi_modal_inputs,
-                ) = self._build_teacher_prompt_inputs(
-                    teacher_messages,
-                    responses[i],
-                    response_mask[i],
-                    max_prompt_len=self_distillation_cfg.max_reprompt_len,
-                )
-                teacher_input_ids_list.append(teacher_input_ids)
-                teacher_attention_mask_list.append(teacher_attention_mask)
-                teacher_position_ids_list.append(teacher_position_ids)
-                teacher_response_start_idx_list.append(teacher_response_start_idx)
-                teacher_multi_modal_inputs_list.append(teacher_multi_modal_inputs)
+                present_mask = torch.tensor(present_mask_list, dtype=torch.float32, device=device)
+                return {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                    "position_ids": position_ids,
+                    "response_start_idx": torch.stack(response_start_idx_list).to(device),
+                    "multi_modal_inputs": multi_modal_inputs_list,
+                    "present_mask": present_mask,
+                }
 
-            teacher_input_ids = torch.nn.utils.rnn.pad_sequence(
-                teacher_input_ids_list,
-                batch_first=True,
-                padding_value=self.tokenizer.pad_token_id or 0,
-            ).to(device)
-            teacher_attention_mask = torch.nn.utils.rnn.pad_sequence(
-                teacher_attention_mask_list,
-                batch_first=True,
-                padding_value=0,
-            ).to(device)
-
-            max_teacher_len = teacher_input_ids.shape[1]
-            if teacher_position_ids_list[0].dim() == 1:
-                teacher_position_ids = torch.zeros(
-                    (batch_size, max_teacher_len),
-                    dtype=teacher_position_ids_list[0].dtype,
-                    device=device,
-                )
-                for i, position_ids in enumerate(teacher_position_ids_list):
-                    teacher_position_ids[i, : position_ids.shape[-1]] = position_ids.to(device)
-            else:
-                rope_dims = teacher_position_ids_list[0].shape[0]
-                teacher_position_ids = torch.zeros(
-                    (batch_size, rope_dims, max_teacher_len),
-                    dtype=teacher_position_ids_list[0].dtype,
-                    device=device,
-                )
-                for i, position_ids in enumerate(teacher_position_ids_list):
-                    teacher_position_ids[i, :, : position_ids.shape[-1]] = position_ids.to(device)
-
-            teacher_present_mask = torch.tensor(teacher_present_mask_list, dtype=torch.float32, device=device)
+            side = build_side(teacher_image_key)
+            teacher_present_mask = side["present_mask"]
             grpo_fallback_count = float(batch_size - teacher_present_mask.sum().item())
             metrics = {
                 "self_distillation/teacher_always_on_fraction": teacher_present_mask.mean().item(),
@@ -1389,16 +1398,35 @@ class RayPPOTrainer:
                 "self_distillation/policy_fallback_fraction": (1.0 - teacher_present_mask.mean()).item(),
                 "self_distillation/grpo_fallback_count": grpo_fallback_count,
             }
-            return DataProto.from_dict(
-                tensors={
-                    "teacher_input_ids": teacher_input_ids,
-                    "teacher_attention_mask": teacher_attention_mask,
-                    "teacher_position_ids": teacher_position_ids,
-                    "teacher_response_start_idx": torch.stack(teacher_response_start_idx_list).to(device),
-                    "self_distillation_mask": teacher_present_mask,
-                },
-                non_tensors={"teacher_multi_modal_inputs": teacher_multi_modal_inputs_list},
-            ), metrics
+            tensors = {
+                "teacher_input_ids": side["input_ids"],
+                "teacher_attention_mask": side["attention_mask"],
+                "teacher_position_ids": side["position_ids"],
+                "teacher_response_start_idx": side["response_start_idx"],
+                "self_distillation_mask": teacher_present_mask,
+            }
+            non_tensors = {"teacher_multi_modal_inputs": side["multi_modal_inputs"]}
+
+            # OPD-Aha: 第二套 teacher 输入 (mean-RGB null 图), 同一构建机制
+            if self_distillation_cfg.get("aha_enable", False):
+                null_key = self_distillation_cfg.get("null_image_key", None)
+                if null_key not in batch.non_tensor_batch:
+                    raise KeyError(f"Null image key `{null_key}` not found in batch.non_tensor_batch")
+                null_side = build_side(null_key)
+                if bool(((teacher_present_mask > 0) & (null_side["present_mask"] <= 0)).any()):
+                    raise ValueError(
+                        "aha: some samples have teacher images but no null images; "
+                        "u = log p+ - log p0 would be garbage for them."
+                    )
+                tensors.update({
+                    "null_input_ids": null_side["input_ids"],
+                    "null_attention_mask": null_side["attention_mask"],
+                    "null_position_ids": null_side["position_ids"],
+                    "null_response_start_idx": null_side["response_start_idx"],
+                })
+                non_tensors["null_multi_modal_inputs"] = null_side["multi_modal_inputs"]
+
+            return DataProto.from_dict(tensors=tensors, non_tensors=non_tensors), metrics
 
         response_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in responses]
         prompt_texts = [self._message_content_to_text(msgs[-1]["content"]) for msgs in batch.non_tensor_batch["raw_prompt"]]
@@ -1526,6 +1554,10 @@ class RayPPOTrainer:
         teacher_image_key = self.config.actor_rollout_ref.actor.get("self_distillation", {}).get("teacher_image_key", None)
         if teacher_image_key and teacher_image_key in batch.non_tensor_batch:
             reward_model_keys.add(teacher_image_key)
+        # OPD-Aha 的 null 图像列同样要保留, 否则在 rollout 前被 pop 掉
+        null_image_key = self.config.actor_rollout_ref.actor.get("self_distillation", {}).get("null_image_key", None)
+        if null_image_key and null_image_key in batch.non_tensor_batch:
+            reward_model_keys.add(null_image_key)
 
         # pop those keys for generation
         batch_keys_to_pop = []

@@ -232,6 +232,17 @@ self_distillation:
   # Constant advantage for opsa_mode=fixed (must be non-zero)
   opsa_fixed_advantage: null
 
+  # OPD-Aha repro: q = softmax((1+beta) log p+ - beta log p0) through the alpha-JSD path;
+  # p0 = frozen teacher on mean-RGB null images (null_image_key column). Requires
+  # full_logit_distillation + distillation_topk + distillation_add_tail.
+  aha_enable: False
+  aha_beta: 4.0
+  # Plausibility floor (anti-squeezing): zero negative u on dims with p+ < floor*max(p+);
+  # null = faithful repro (no floor)
+  aha_floor_alpha: null
+  # Parquet column holding the mean-RGB null teacher images
+  null_image_key: null
+
   # IS clip for loss; null disables IS weighting
   is_clip: 2
 

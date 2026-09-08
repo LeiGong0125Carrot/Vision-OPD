@@ -157,6 +157,15 @@ class SelfDistillationConfig(BaseConfig):
     opsa_advantage_min: float = -1.0  # highest-entropy selected token gets this
     opsa_advantage_max: float = -0.5  # lowest-entropy selected token gets this
     opsa_fixed_advantage: Optional[float] = None  # only for opsa_mode="fixed"
+    # --- OPD-Aha repro (revision_opd Eq.12-13): teacher real-vs-null reconstruction ---
+    # q = softmax((1+beta) log p+ - beta log p0) fed through the standard alpha-JSD
+    # distillation path; p0 = frozen teacher on mean-RGB null images (null_image_key).
+    # aha_floor_alpha: plausibility floor (Ren ICLR25 anti-squeezing) — negative u zeroed
+    # on valley dims (p+ < floor_alpha * max p+); None = faithful repro.
+    aha_enable: bool = False
+    aha_beta: float = 4.0
+    aha_floor_alpha: Optional[float] = None
+    null_image_key: Optional[str] = None
 
     def __post_init__(self):
         if not 0.0 <= self.alpha <= 1.0:
@@ -203,6 +212,20 @@ class SelfDistillationConfig(BaseConfig):
                 raise ValueError("evt_clip_neg/evt_clip_pos must be positive magnitudes.")
             if not 0.0 < self.evt_ema_eta <= 1.0:
                 raise ValueError(f"evt_ema_eta must be in (0,1], got {self.evt_ema_eta}")
+        if self.aha_enable:
+            if self.state_adaptive or self.evt_enable or self.opsa_enable:
+                raise ValueError("aha_enable is mutually exclusive with state_adaptive/evt_enable/opsa_enable.")
+            if not self.full_logit_distillation or self.distillation_topk is None or not self.distillation_add_tail:
+                raise ValueError(
+                    "aha_enable requires full_logit_distillation=True, distillation_topk set, "
+                    "and distillation_add_tail=True (top-k + tail support)."
+                )
+            if self.null_image_key is None:
+                raise ValueError("aha_enable requires self_distillation.null_image_key (mean-RGB null images).")
+            if self.aha_beta < 0:
+                raise ValueError(f"aha_beta must be >= 0, got {self.aha_beta}")
+            if self.aha_floor_alpha is not None and not 0.0 < self.aha_floor_alpha < 1.0:
+                raise ValueError(f"aha_floor_alpha must be in (0,1) or None, got {self.aha_floor_alpha}")
         if self.opsa_enable:
             if self.state_adaptive or self.evt_enable:
                 raise ValueError("opsa_enable is mutually exclusive with state_adaptive and evt_enable.")

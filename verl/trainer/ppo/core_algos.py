@@ -1211,6 +1211,57 @@ def compute_self_distillation_loss(
     return loss, metrics
 
 
+def reconstruct_aha_target(
+    teacher_topk_logps: torch.Tensor,
+    teacher_null_topk_logps: torch.Tensor,
+    beta: float,
+    floor_alpha: Optional[float] = None,
+    response_mask: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """OPD-Aha 式重建目标 (revision_opd Eq.12) + plausibility floor (Ren ICLR25 抗挤压).
+
+    输入: teacher 在学生 top-k 支持上的 logp (K 维, 全词表归一, 未含尾桶) —— p⁺ 特权图 /
+    p⁰ 空白图两份。内部各自补尾桶成 K+1 真分布, u = log p⁺ − log p⁰,
+    log q = log_softmax(log p⁺ + β·u_gated)。
+
+    floor (floor_alpha 非 None 时): 对 p⁺ < floor_alpha·max(p⁺) 的谷区维, 负 u 截为 0
+    —— 负梯度只落在头部, 消除挤压触发 (尾桶天然属谷区, 同规则)。floor_alpha=None 即原版。
+
+    返回 (log_q 的前 K 列, metrics)。前 K 列在概率域和 <1, 交给
+    compute_self_distillation_loss(distillation_add_tail=True) 会精确补回尾桶
+    —— 切勿传 K+1 维。全程 no_grad。
+    """
+    with torch.no_grad():
+        log_h = _sa_add_tail_log_probs(teacher_topk_logps.float())      # (B,T,K+1)
+        log_f = _sa_add_tail_log_probs(teacher_null_topk_logps.float())
+        u = log_h - log_f
+        n_clamped = torch.zeros((), device=u.device)
+        valley_neg = ((u < 0) & (log_h < math.log(0.1) + log_h.max(dim=-1, keepdim=True).values))
+        if floor_alpha is not None:
+            valley = log_h < math.log(floor_alpha) + log_h.max(dim=-1, keepdim=True).values
+            clamp_mask = valley & (u < 0)
+            n_clamped = clamp_mask.float().sum()
+            u = torch.where(clamp_mask, torch.zeros_like(u), u)
+        log_q = torch.log_softmax(log_h + beta * u, dim=-1)
+
+        def _pm(x):
+            # 逐位置均值, 可选 response_mask 过滤
+            per_pos = x
+            if response_mask is not None:
+                m = response_mask > 0.5
+                per_pos = x[m] if m.any() else x
+            return float(per_pos.float().mean().item())
+
+        metrics = {
+            "aha/u_mean": _pm(u.mean(dim=-1)),
+            "aha/u_neg_valley_frac": _pm(valley_neg.float().mean(dim=-1)),
+            "aha/floor_clamped_frac": float(
+                (n_clamped / max(u.numel(), 1)).item()) if floor_alpha is not None else 0.0,
+            "aha/q_tail_mass": _pm(log_q[..., -1].exp()),
+        }
+    return log_q[..., :-1], metrics
+
+
 def _sa_add_tail_log_probs(log_probs: torch.Tensor) -> torch.Tensor:
     """Append a tail bucket so the top-k support becomes a proper distribution."""
     log_s = torch.logsumexp(log_probs, dim=-1, keepdim=True)
