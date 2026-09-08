@@ -51,6 +51,9 @@ assert torch.allclose(lhs, rhs, atol=1e-4), "log-odds 差应等于 Δlog_h + β�
 # 与手算 K+1 重建精确一致 (含尾桶维)
 internal = torch.log_softmax(log_h + beta * u, dim=-1)
 assert torch.allclose(qb, internal[..., :-1], atol=1e-6), "K 列应与手算重建逐元素一致"
+# 关键契约: 损失侧 add_tail 从 K 列重建出的尾桶 == q 内部的真尾桶 (fp32)
+assert torch.allclose(full_q(qb), internal, atol=1e-3), "add_tail 重建的 K+1 分布应还原内部 q (含尾桶)"
+assert not qb.requires_grad, "重建 q 不得携带梯度"
 
 # --- 3. 归一化守恒: 返回的 K 列概率和 < 1, 补尾后 K+1 和 = 1 ---
 assert (qb.exp().sum(-1) < 1.0 + 1e-6).all(), "K 列概率和必须 < 1 (留给尾桶)"
@@ -64,11 +67,13 @@ clamp = valley & (u < 0)
 u_gated = torch.where(clamp, torch.zeros_like(u), u)
 expected = torch.log_softmax(log_h + beta * u_gated, dim=-1)[..., :-1]
 assert torch.allclose(qf, expected, atol=1e-5), "floor 版 q 与手算 gated 重建不一致"
-# 头部维 (非谷区) 在两版中 log-odds 关系不变
-head = ~valley[..., :-1]
-if head.any():
-    # 对同一位置的两个头部维, floor 前后 q 的 log-odds 差一致
-    pos = head.all(dim=-1)  # 位置上所有前 K 维都是头部的情形可能少, 用维对法更稳
+# 头部维 (非谷区) 在两版中 log-odds 关系不变: 取每个位置的前两维 (top-2, 几乎必属头部),
+# 仅在两维都非谷区的位置断言 floor 前后 log-odds 差一致
+both_head = ~valley[..., 0] & ~valley[..., 1]
+assert both_head.any(), "构造数据下应存在 top-2 双头部位置"
+lo_repro = (qb[..., 0] - qb[..., 1])[both_head]
+lo_floor = (qf[..., 0] - qf[..., 1])[both_head]
+assert torch.allclose(lo_repro, lo_floor, atol=1e-5), "floor 不得改变头部维之间的 log-odds"
 # 谷区负 u 维: floor 版概率 >= 原版 (负压被解除)
 assert (qf.exp()[clamp[..., :-1]] >= qb.exp()[clamp[..., :-1]] - 1e-6).all(), \
     "被 clamp 的谷区维概率不应低于原版"

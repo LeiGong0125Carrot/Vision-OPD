@@ -1234,18 +1234,18 @@ def reconstruct_aha_target(
     with torch.no_grad():
         log_h = _sa_add_tail_log_probs(teacher_topk_logps.float())      # (B,T,K+1)
         log_f = _sa_add_tail_log_probs(teacher_null_topk_logps.float())
-        u = log_h - log_f
-        n_clamped = torch.zeros((), device=u.device)
-        valley_neg = ((u < 0) & (log_h < math.log(0.1) + log_h.max(dim=-1, keepdim=True).values))
+        u_raw = log_h - log_f
+        u = u_raw
+        valley_neg = ((u_raw < 0) & (log_h < math.log(0.1) + log_h.max(dim=-1, keepdim=True).values))
+        clamp_mask = torch.zeros_like(valley_neg)
         if floor_alpha is not None:
             valley = log_h < math.log(floor_alpha) + log_h.max(dim=-1, keepdim=True).values
-            clamp_mask = valley & (u < 0)
-            n_clamped = clamp_mask.float().sum()
-            u = torch.where(clamp_mask, torch.zeros_like(u), u)
+            clamp_mask = valley & (u_raw < 0)
+            u = torch.where(clamp_mask, torch.zeros_like(u_raw), u_raw)
         log_q = torch.log_softmax(log_h + beta * u, dim=-1)
 
         def _pm(x):
-            # 逐位置均值, 可选 response_mask 过滤
+            # 逐位置均值, 可选 response_mask 过滤 (padding 位置的 logp 是 gather 垃圾, 必须滤)
             per_pos = x
             if response_mask is not None:
                 m = response_mask > 0.5
@@ -1253,10 +1253,10 @@ def reconstruct_aha_target(
             return float(per_pos.float().mean().item())
 
         metrics = {
-            "aha/u_mean": _pm(u.mean(dim=-1)),
+            # 恒用 pre-clamp 的 u_raw, 两臂曲线才可比
+            "aha/u_mean": _pm(u_raw.mean(dim=-1)),
             "aha/u_neg_valley_frac": _pm(valley_neg.float().mean(dim=-1)),
-            "aha/floor_clamped_frac": float(
-                (n_clamped / max(u.numel(), 1)).item()) if floor_alpha is not None else 0.0,
+            "aha/floor_clamped_frac": _pm(clamp_mask.float().mean(dim=-1)),
             "aha/q_tail_mass": _pm(log_q[..., -1].exp()),
         }
     return log_q[..., :-1], metrics
