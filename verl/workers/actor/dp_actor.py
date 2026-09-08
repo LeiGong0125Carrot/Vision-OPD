@@ -953,6 +953,7 @@ class DataParallelPPOActor(BasePPOActor):
                 "timing_s/update_actor/student_forward": 0.0,
                 "timing_s/update_actor/teacher_forward": 0.0,
                 "timing_s/update_actor/teacher_full_forward": 0.0,
+                "timing_s/update_actor/teacher_null_forward": 0.0,
                 "timing_s/update_actor/loss_compute": 0.0,
                 "timing_s/update_actor/backward": 0.0,
                 "timing_s/update_actor/optimizer_step": 0.0,

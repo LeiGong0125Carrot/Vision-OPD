@@ -222,6 +222,12 @@ class SelfDistillationConfig(BaseConfig):
                 )
             if self.null_image_key is None:
                 raise ValueError("aha_enable requires self_distillation.null_image_key (mean-RGB null images).")
+            if not self.teacher_always_on or not self.teacher_image_key or self.teacher_prompt_mode == "answer_hint":
+                raise ValueError(
+                    "aha_enable requires teacher_always_on=True with teacher_image_key set "
+                    "(and teacher_prompt_mode != 'answer_hint'): the null-side inputs are only "
+                    "built on the teacher_always_on construction path."
+                )
             if self.aha_beta < 0:
                 raise ValueError(f"aha_beta must be >= 0, got {self.aha_beta}")
             if self.aha_floor_alpha is not None and not 0.0 < self.aha_floor_alpha < 1.0:
