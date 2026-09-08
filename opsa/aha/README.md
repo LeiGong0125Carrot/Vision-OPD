@@ -43,7 +43,20 @@ bash opsa/aha/run_aha_4b.sh
 
 # 臂 2: Aha+floor (抗挤压)
 AHA_FLOOR_ALPHA=0.1 bash opsa/aha/run_aha_4b.sh
+
+# 臂 A: u 中心化 (滤词表级偏好通道; 可与 floor 叠加)
+AHA_CENTER_U=True bash opsa/aha/run_aha_4b.sh
+
+# 臂 B: 共享上下文特权对 (p⁺=全图+GT crops vs p⁰=全图+空白块)
+#   先跑 prep_pair_images.py 生成 train_sa4k_pair.parquet
+TASK_TRAIN_FILE=$PWD/data/TreeVGR-RL-37K/train_sa4k_pair.parquet \
+  EXPERIMENT_SUFFIX=pair bash opsa/aha/run_aha_4b.sh
 ```
+
+注意 (2026-09-08 终审后): repro 在 TB 负收益, floor TB 峰 48.89@25 超 V0 48.40 —
+臂 A/B 是针对"u 视野错配通道"根因的后续实验, 详见主仓 docs/09_08_aha_verdict.md。
+在 interactive 分配上跑必须 `srun --overlap --cpus-per-task=8` 并把 TRITON_CACHE_DIR/
+TORCHINDUCTOR_CACHE_DIR 指到节点本地 /tmp (weka 共享缓存有并发竞态)。
 
 同 V0 预算: train_sa4k_aha 4000 行, batch 96 × n 8, lr 2e-6, 1 epoch ≈ 41 步,
 save_freq 5。每步比 V0 多一次 teacher 前向, 预计 6-9h/臂。

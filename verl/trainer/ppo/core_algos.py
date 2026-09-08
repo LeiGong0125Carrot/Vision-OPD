@@ -1217,6 +1217,8 @@ def reconstruct_aha_target(
     beta: float,
     floor_alpha: Optional[float] = None,
     response_mask: Optional[torch.Tensor] = None,
+    center_u: bool = False,
+    token_ids: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """OPD-Aha 式重建目标 (revision_opd Eq.12) + plausibility floor (Ren ICLR25 抗挤压).
 
@@ -1227,6 +1229,12 @@ def reconstruct_aha_target(
     floor (floor_alpha 非 None 时): 对 p⁺ < floor_alpha·max(p⁺) 的谷区维, 负 u 截为 0
     —— 负梯度只落在头部, 消除挤压触发 (尾桶天然属谷区, 同规则)。floor_alpha=None 即原版。
 
+    center_u: 按 token 类型对 u 做 p⁺ 加权去均值 (复用 SA v2 的 _sa_center_u_per_token_type),
+    滤掉"某 token 在所有位置被同向推"的词表级偏好通道 (hide 形态的视野错配伪信号),
+    保留位置特异的证据异议。注意: 逐位置均匀去均值会被 softmax 平移不变性完全吸收,
+    只有按类型的差异化去均值才改变 q。需要 token_ids (学生 top-k 词表 id, [B,T,K])。
+    施加顺序: center → floor → 重建。
+
     返回 (log_q 的前 K 列, metrics)。前 K 列在概率域和 <1, 交给
     compute_self_distillation_loss(distillation_add_tail=True) 会精确补回尾桶
     —— 切勿传 K+1 维。全程 no_grad。
@@ -1234,7 +1242,14 @@ def reconstruct_aha_target(
     with torch.no_grad():
         log_h = _sa_add_tail_log_probs(teacher_topk_logps.float())      # (B,T,K+1)
         log_f = _sa_add_tail_log_probs(teacher_null_topk_logps.float())
-        u_raw = log_h - log_f
+        u_pre = log_h - log_f
+        u_raw = u_pre
+        if center_u:
+            if token_ids is None or response_mask is None:
+                raise ValueError("center_u requires token_ids (student top-k vocab ids) and response_mask.")
+            u_raw = _sa_center_u_per_token_type(
+                u_pre, weights=log_h.exp(), token_ids=token_ids, loss_mask=response_mask
+            )
         u = u_raw
         valley_neg = ((u_raw < 0) & (log_h < math.log(0.1) + log_h.max(dim=-1, keepdim=True).values))
         clamp_mask = torch.zeros_like(valley_neg)
@@ -1253,12 +1268,15 @@ def reconstruct_aha_target(
             return float(per_pos.float().mean().item())
 
         metrics = {
-            # 恒用 pre-clamp 的 u_raw, 两臂曲线才可比
-            "aha/u_mean": _pm(u_raw.mean(dim=-1)),
+            # u_mean 恒用 pre-center pre-clamp 的 u, 所有臂可比; centered 版单独报
+            "aha/u_mean": _pm(u_pre.mean(dim=-1)),
             "aha/u_neg_valley_frac": _pm(valley_neg.float().mean(dim=-1)),
             "aha/floor_clamped_frac": _pm(clamp_mask.float().mean(dim=-1)),
             "aha/q_tail_mass": _pm(log_q[..., -1].exp()),
         }
+        if center_u:
+            metrics["aha/u_centered_mean"] = _pm(u_raw.mean(dim=-1))
+            metrics["aha/u_centered_absmean"] = _pm(u_raw.abs().mean(dim=-1))
     return log_q[..., :-1], metrics
 
 

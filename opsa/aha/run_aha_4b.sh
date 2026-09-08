@@ -60,13 +60,18 @@ CUSTOM_CHAT_TEMPLATE_FILE="${PROJECT_ROOT}/chat_templates/perception_chat_templa
 # --- Aha knobs ---
 AHA_BETA=${AHA_BETA:-4.0}
 AHA_FLOOR_ALPHA=${AHA_FLOOR_ALPHA:-null}   # null=repro 臂; 0.1=floor 臂
+AHA_CENTER_U=${AHA_CENTER_U:-False}        # True=中心化臂 (按 token 类型去均值)
 FULL_LOGIT=True; TOPK=100                  # aha 硬性要求 (top-k+尾桶支持)
 
 # --- Data ---
 TASK_TRAIN_FILE="${TASK_TRAIN_FILE:-${PROJECT_ROOT}/data/TreeVGR-RL-37K/train_sa4k_aha.parquet}"
 
 MODEL_NAME=$(basename "$MODEL_PATH")
-if [[ "$AHA_FLOOR_ALPHA" != "null" ]]; then
+if [[ "$AHA_CENTER_U" == "True" && "$AHA_FLOOR_ALPHA" != "null" ]]; then
+    EXPERIMENT_NAME="Aha-center-floor-${MODEL_NAME}"
+elif [[ "$AHA_CENTER_U" == "True" ]]; then
+    EXPERIMENT_NAME="Aha-center-${MODEL_NAME}"
+elif [[ "$AHA_FLOOR_ALPHA" != "null" ]]; then
     EXPERIMENT_NAME="Aha-floor-${MODEL_NAME}"
 else
     EXPERIMENT_NAME="Aha-${MODEL_NAME}"
@@ -143,6 +148,7 @@ python3 -m verl.trainer.main_ppo --config-name "$CONFIG_NAME" \
     actor_rollout_ref.actor.self_distillation.aha_enable=True \
     actor_rollout_ref.actor.self_distillation.aha_beta=$AHA_BETA \
     actor_rollout_ref.actor.self_distillation.aha_floor_alpha=$AHA_FLOOR_ALPHA \
+    actor_rollout_ref.actor.self_distillation.aha_center_u=$AHA_CENTER_U \
     actor_rollout_ref.actor.self_distillation.null_image_key=null_images \
     actor_rollout_ref.actor.self_distillation.max_reprompt_len=10240 \
     actor_rollout_ref.actor.self_distillation.is_clip=2.0 \

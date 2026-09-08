@@ -92,4 +92,31 @@ mask[:, :2] = 1.0
 qm, _ = reconstruct_aha_target(h, f, beta=beta, floor_alpha=None, response_mask=mask)
 assert torch.allclose(qm, qb), "response_mask 只影响 metrics, 不得影响 q"
 
+# --- 7. center_u: 词表级恒定偏好被滤掉, 位置尖峰保留 ---
+full_mask = torch.ones(B, T)
+tok = torch.arange(K).unsqueeze(0).unsqueeze(0).expand(B, T, K).contiguous()  # 每位置同词表
+# 构造: 恒定通道 c_k (每 token 类型一个常数) + 位置尖峰 (b0,t0,k0)
+c = torch.randn(K + 1) * 0.5
+u_const = c.expand(B, T, K + 1).contiguous()
+spike = torch.zeros(B, T, K + 1); spike[0, 3, 2] = -2.0
+# 用 f = h - u 反推出能产生该 u 的 null 側 (仅取前 K 列; 尾桶由归一化决定, 近似)
+log_h_t = _sa_add_tail_log_probs(h.float())
+u_target = u_const + spike
+qc, mc = reconstruct_aha_target(h, (log_h_t - u_target)[..., :K], beta=1.0,
+                                floor_alpha=None, response_mask=full_mask,
+                                center_u=True, token_ids=tok)
+qnc, _ = reconstruct_aha_target(h, (log_h_t - u_target)[..., :K], beta=1.0,
+                                floor_alpha=None, response_mask=full_mask)
+# 中心化后均值指标应接近 0, 且明显小于未中心化的 |u|
+assert abs(mc["aha/u_centered_mean"]) < 0.05, f"中心化后均值应≈0, got {mc['aha/u_centered_mean']}"
+# 恒定通道被滤掉 → qc 应比 qnc 更接近 p⁺ (恒定通道在 qnc 里扭曲 q, 在 qc 里不再扭曲)
+# 位置尖峰保留 → 在 (0,3,2) 处 qc 仍显著低于 p⁺
+d_spike = (qc[0, 3, 2] - h.float()[0, 3, 2]).item()
+assert d_spike < -0.5, f"位置尖峰应保留负压, got {d_spike}"
+# 无尖峰位置: qc ≈ p⁺ (中心化清掉了唯一的恒定通道)
+d_clean = (qc[1] - h.float()[1]).abs().max().item()
+assert d_clean < 0.35, f"纯恒定通道位置中心化后应≈p⁺, got {d_clean}"
+# requires_grad 卫生
+assert not qc.requires_grad
+
 print("ALL TESTS PASSED")

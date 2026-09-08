@@ -240,6 +240,8 @@ self_distillation:
   # Plausibility floor (anti-squeezing): zero negative u on dims with p+ < floor*max(p+);
   # null = faithful repro (no floor)
   aha_floor_alpha: null
+  # Per-token-type centering of u (filters vocabulary-level constant-preference channel)
+  aha_center_u: False
   # Parquet column holding the mean-RGB null teacher images
   null_image_key: null
 

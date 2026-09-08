@@ -165,6 +165,10 @@ class SelfDistillationConfig(BaseConfig):
     aha_enable: bool = False
     aha_beta: float = 4.0
     aha_floor_alpha: Optional[float] = None
+    # Per-token-type weighted centering of u before reconstruction (filters the
+    # vocabulary-level constant-preference channel; positional uniform centering
+    # would be absorbed by softmax shift invariance, so only this form matters).
+    aha_center_u: bool = False
     null_image_key: Optional[str] = None
 
     def __post_init__(self):
