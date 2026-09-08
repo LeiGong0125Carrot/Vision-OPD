@@ -20,7 +20,8 @@ CLONE=/sfs/weka/scratch/nkw3mr/Vision-OPD-OPSA
 SETUP=/sfs/weka/scratch/nkw3mr/Vision-OPD-setup
 source "$SETUP/00_env.sh"
 
-TAG="OPSA-Qwen3.5-4B"; SHORT="opsa4b"
+# 臂可通过 env 覆盖: sbatch --export=ALL,ARM_TAG=Aha-Qwen3.5-4B,ARM_SHORT=aha4b ...
+TAG="${ARM_TAG:-OPSA-Qwen3.5-4B}"; SHORT="${ARM_SHORT:-opsa4b}"
 if [ -n "${EXPERIMENT_SUFFIX:-}" ]; then
   TAG="${TAG}-${EXPERIMENT_SUFFIX}"; SHORT="${SHORT}-${EXPERIMENT_SUFFIX}"
 fi
