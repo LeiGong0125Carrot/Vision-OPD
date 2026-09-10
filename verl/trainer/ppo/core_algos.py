@@ -1277,6 +1277,10 @@ def reconstruct_aha_target(
         if center_u:
             metrics["aha/u_centered_mean"] = _pm(u_raw.mean(dim=-1))
             metrics["aha/u_centered_absmean"] = _pm(u_raw.abs().mean(dim=-1))
+            # 中心化是 p⁺ 加权的, 归零的是加权均值 (头部/质量区); 无权重均值被谷区主导,
+            # 不是正确的生效性读数 —— 这个才应 ≈0
+            _w = log_h.exp()
+            metrics["aha/u_centered_wmean"] = _pm((u_raw * _w).sum(dim=-1) / _w.sum(dim=-1).clamp_min(1e-8))
     return log_q[..., :-1], metrics
 
 
