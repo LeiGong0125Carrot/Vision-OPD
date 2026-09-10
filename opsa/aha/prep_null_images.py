@@ -29,10 +29,13 @@ DATA_DIR = os.path.join(REPO, "data", "TreeVGR-RL-37K")
 SRC_PARQUET = os.path.join(DATA_DIR, "train_sa4k_hide.parquet")
 OUT_PARQUET = os.path.join(DATA_DIR, "train_sa4k_aha.parquet")
 NULL_DIR = os.path.join(DATA_DIR, "teacher_images_null")
+# 高清 6karmA (2459 题, 2026-09-09 起的标准训练集):
+#   --src train_6k_armA_hide.parquet --out train_6karmA_aha.parquet --null-dir teacher_images_null6k
 
 
-def make_null(src_path: str) -> str:
-    dst = os.path.join(NULL_DIR, os.path.basename(src_path))
+def make_null(job) -> str:
+    src_path, null_dir = job
+    dst = os.path.join(null_dir, os.path.basename(src_path))
     if os.path.exists(dst):
         return dst
     with Image.open(src_path) as im:
@@ -44,17 +47,28 @@ def make_null(src_path: str) -> str:
 
 
 def main():
+    global NULL_DIR
     ap = argparse.ArgumentParser()
     ap.add_argument("--workers", type=int, default=16)
+    ap.add_argument("--src", default=SRC_PARQUET)
+    ap.add_argument("--out", default=OUT_PARQUET)
+    ap.add_argument("--null-dir", default=NULL_DIR)
     args = ap.parse_args()
+    NULL_DIR = args.null_dir if os.path.isabs(args.null_dir) else os.path.join(DATA_DIR, args.null_dir)
+    src_parquet = args.src if os.path.isabs(args.src) else os.path.join(DATA_DIR, args.src)
+    out_parquet = args.out if os.path.isabs(args.out) else os.path.join(DATA_DIR, args.out)
 
     os.makedirs(NULL_DIR, exist_ok=True)
-    df = pd.read_parquet(SRC_PARQUET)
+    df = pd.read_parquet(src_parquet)
     srcs = [row[0]["path"] for row in df["bbox_images"]]
     assert all(len(row) == 1 for row in df["bbox_images"]), "每行应恰好 1 张特权图"
 
-    with ProcessPoolExecutor(max_workers=args.workers) as ex:
-        dsts = list(ex.map(make_null, srcs, chunksize=64))
+    jobs = [(s, NULL_DIR) for s in srcs]
+    if args.workers <= 1:
+        dsts = [make_null(j) for j in jobs]
+    else:
+        with ProcessPoolExecutor(max_workers=args.workers) as ex:
+            dsts = list(ex.map(make_null, jobs, chunksize=64))
 
     # 抽查: 尺寸一致 + 纯色
     for i in np.random.RandomState(0).choice(len(srcs), 20, replace=False):
@@ -64,8 +78,8 @@ def main():
             assert bar.std(axis=(0, 1)).max() < 3.0, f"非纯色(jpeg噪声超限): {dsts[i]}"
 
     df["null_images"] = [[{"path": p}] for p in dsts]
-    df.to_parquet(OUT_PARQUET, index=False)
-    print(f"OK: {len(df)} rows -> {OUT_PARQUET}")
+    df.to_parquet(out_parquet, index=False)
+    print(f"OK: {len(df)} rows -> {out_parquet}")
     print(f"null images: {NULL_DIR} ({len(set(dsts))} unique)")
 
 
