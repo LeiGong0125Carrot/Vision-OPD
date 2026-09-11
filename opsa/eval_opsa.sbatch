@@ -37,7 +37,8 @@ echo " OPSA 评测  job=${SLURM_JOB_ID:-NA}  节点=$(hostname)  $(date)"
 echo " 臂=$TAG  ckpt=$CKPT_ROOT"
 echo "=========================================================="
 
-STEPS=$(ls -d "$CKPT_ROOT"/global_step_* 2>/dev/null | sed 's/.*global_step_//' | sort -n | tr '\n' ' ')
+# STEPS_OVERRIDE="55 60 65" 可只评指定 step (如续训后的新增 ckpt, 避免覆盖已判卷的旧答案)
+STEPS="${STEPS_OVERRIDE:-$(ls -d "$CKPT_ROOT"/global_step_* 2>/dev/null | sed 's/.*global_step_//' | sort -n | tr '\n' ' ')}"
 echo ">>> checkpoints: $STEPS"
 [ -z "$STEPS" ] && { echo "❌ 无 checkpoint"; exit 1; }
 
