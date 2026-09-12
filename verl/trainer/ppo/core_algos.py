@@ -1242,8 +1242,9 @@ def reconstruct_aha_target(
     施加顺序: center → floor → 重建。
 
     zone_enable (TZR 三区重建, 与 floor/center 互斥): 按 (p⁺,p⁰,p_S) 头部划分
-    AGREE/EVID/PRIOR 三区, β 定向 — AGREE 冻结(β=0), EVID 抬升(β), PRIOR 压制
-    (β_neg, 须过防挤压门 p_S 头部 + 教师可错门 margin)。需 student_topk_logps。
+    AGREE/EVID/PRIOR 三区, β 定向 — AGREE 冻结(β=0); EVID 且 u>0 抬升(β);
+    PRIOR 压制(β_neg) 须同时: 学生头部(防挤压门) ∧ u ≤ −zone_margin(拒绝强度门,
+    兼保 u<0 方向正确) ∧ 非尾桶。需 student_topk_logps。
 
     返回 (log_q 的前 K 列, metrics)。前 K 列在概率域和 <1, 交给
     compute_self_distillation_loss(distillation_add_tail=True) 会精确补回尾桶
@@ -1276,14 +1277,22 @@ def reconstruct_aha_target(
             head_h = log_h >= math.log(zone_tau) + log_h.max(dim=-1, keepdim=True).values
             head_f = log_f >= math.log(zone_tau) + log_f.max(dim=-1, keepdim=True).values
             head_s = log_s >= math.log(zone_eps) + log_s.max(dim=-1, keepdim=True).values
-            margin_ok = (log_h.max(dim=-1, keepdim=True).values - log_h) >= zone_margin
             zone_agree = head_h & head_f
             zone_evid = head_h & ~head_f
             zone_prior = ~head_h & head_f
-            press = zone_prior & head_s & margin_ok
+            # 审查修正 (ee6ebaf 后): 相对头部 ≠ u 符号 — ¬head_h∧head_f 不蕴含 u<0
+            # (h 比 f 更尖时 ~21% press 维 u>0, β_neg 会反向放大)。press 条件改为
+            # u ≤ −margin: 结构上保证只压负 u, 且 margin 门有实义 (证据视图相对 null
+            # 至少以 margin nats 拒绝该 token 才压; 教师犹豫处自然不压)。
+            press = zone_prior & head_s & (u <= -zone_margin)
+            # 尾桶不参与 press: 学生高熵位置压尾桶 = 把全部支持外质量挤向 argmax
+            # (恰是防挤压门要保护的位置)。
+            press[..., -1] = False
+            # EVID 抬升同理只在 u>0 施力 (u<0 的 EVID 维经 β 会被无门压制, 绕过双门)。
+            boost = zone_evid & (u > 0)
             bneg = beta if beta_neg is None else beta_neg
             beta_mat = torch.zeros_like(u)
-            beta_mat = torch.where(zone_evid, torch.full_like(u, float(beta)), beta_mat)
+            beta_mat = torch.where(boost, torch.full_like(u, float(beta)), beta_mat)
             beta_mat = torch.where(press, torch.full_like(u, float(bneg)), beta_mat)
             log_q = torch.log_softmax(log_h + beta_mat * u, dim=-1)
             zone_masks = (zone_agree, zone_evid, zone_prior, press, log_s)
