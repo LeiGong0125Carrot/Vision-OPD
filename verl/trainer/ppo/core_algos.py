@@ -1219,6 +1219,12 @@ def reconstruct_aha_target(
     response_mask: Optional[torch.Tensor] = None,
     center_u: bool = False,
     token_ids: Optional[torch.Tensor] = None,
+    student_topk_logps: Optional[torch.Tensor] = None,
+    zone_enable: bool = False,
+    zone_tau: float = 0.1,
+    zone_eps: float = 0.1,
+    zone_margin: float = 1.0,
+    beta_neg: Optional[float] = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """OPD-Aha 式重建目标 (revision_opd Eq.12) + plausibility floor (Ren ICLR25 抗挤压).
 
@@ -1234,6 +1240,10 @@ def reconstruct_aha_target(
     保留位置特异的证据异议。注意: 逐位置均匀去均值会被 softmax 平移不变性完全吸收,
     只有按类型的差异化去均值才改变 q。需要 token_ids (学生 top-k 词表 id, [B,T,K])。
     施加顺序: center → floor → 重建。
+
+    zone_enable (TZR 三区重建, 与 floor/center 互斥): 按 (p⁺,p⁰,p_S) 头部划分
+    AGREE/EVID/PRIOR 三区, β 定向 — AGREE 冻结(β=0), EVID 抬升(β), PRIOR 压制
+    (β_neg, 须过防挤压门 p_S 头部 + 教师可错门 margin)。需 student_topk_logps。
 
     返回 (log_q 的前 K 列, metrics)。前 K 列在概率域和 <1, 交给
     compute_self_distillation_loss(distillation_add_tail=True) 会精确补回尾桶
@@ -1253,11 +1263,37 @@ def reconstruct_aha_target(
         u = u_raw
         valley_neg = ((u_raw < 0) & (log_h < math.log(0.1) + log_h.max(dim=-1, keepdim=True).values))
         clamp_mask = torch.zeros_like(valley_neg)
-        if floor_alpha is not None:
+        zone_masks = None
+        if zone_enable:
+            # TZR 三区重建: 按 (p⁺, p⁰, p_S) 头部把支持集切三区, β 定向而非均匀。
+            # AGREE(双高)=0 冻结保学生能力; EVID(仅p⁺高)=β 抬升; PRIOR(仅p⁰高=语言先验/
+            # 幻觉候选)=β_neg 压制, 须过两道门: 防挤压门(学生头部才压, Ren 挤压变量是
+            # p_S 非 p⁺ — 这是对 floor 的修正) + 教师可错门(教师⁺以 margin 明确拒绝才压,
+            # 因剩余错误 78% 特权也救不了, 那些位置 u 不含正确信号)。
+            if student_topk_logps is None:
+                raise ValueError("zone_enable requires student_topk_logps.")
+            log_s = _sa_add_tail_log_probs(student_topk_logps.float())
+            head_h = log_h >= math.log(zone_tau) + log_h.max(dim=-1, keepdim=True).values
+            head_f = log_f >= math.log(zone_tau) + log_f.max(dim=-1, keepdim=True).values
+            head_s = log_s >= math.log(zone_eps) + log_s.max(dim=-1, keepdim=True).values
+            margin_ok = (log_h.max(dim=-1, keepdim=True).values - log_h) >= zone_margin
+            zone_agree = head_h & head_f
+            zone_evid = head_h & ~head_f
+            zone_prior = ~head_h & head_f
+            press = zone_prior & head_s & margin_ok
+            bneg = beta if beta_neg is None else beta_neg
+            beta_mat = torch.zeros_like(u)
+            beta_mat = torch.where(zone_evid, torch.full_like(u, float(beta)), beta_mat)
+            beta_mat = torch.where(press, torch.full_like(u, float(bneg)), beta_mat)
+            log_q = torch.log_softmax(log_h + beta_mat * u, dim=-1)
+            zone_masks = (zone_agree, zone_evid, zone_prior, press, log_s)
+        elif floor_alpha is not None:
             valley = log_h < math.log(floor_alpha) + log_h.max(dim=-1, keepdim=True).values
             clamp_mask = valley & (u_raw < 0)
             u = torch.where(clamp_mask, torch.zeros_like(u_raw), u_raw)
-        log_q = torch.log_softmax(log_h + beta * u, dim=-1)
+            log_q = torch.log_softmax(log_h + beta * u, dim=-1)
+        else:
+            log_q = torch.log_softmax(log_h + beta * u, dim=-1)
 
         def _pm(x):
             # 逐位置均值, 可选 response_mask 过滤 (padding 位置的 logp 是 gather 垃圾, 必须滤)
@@ -1281,6 +1317,14 @@ def reconstruct_aha_target(
             # 不是正确的生效性读数 —— 这个才应 ≈0
             _w = log_h.exp()
             metrics["aha/u_centered_wmean"] = _pm((u_raw * _w).sum(dim=-1) / _w.sum(dim=-1).clamp_min(1e-8))
+        if zone_masks is not None:
+            z_agree, z_evid, z_prior, z_press, log_s = zone_masks
+            metrics["aha/zone_agree_frac"] = _pm(z_agree.float().mean(dim=-1))
+            metrics["aha/zone_evid_frac"] = _pm(z_evid.float().mean(dim=-1))
+            metrics["aha/zone_prior_frac"] = _pm(z_prior.float().mean(dim=-1))
+            metrics["aha/zone_press_frac"] = _pm(z_press.float().mean(dim=-1))
+            # 学生视角的实际压制量: 被压维上 p_S 的质量和 (每位置)
+            metrics["aha/prior_suppressed_mass"] = _pm((z_press.float() * log_s.exp()).sum(dim=-1))
     return log_q[..., :-1], metrics
 
 

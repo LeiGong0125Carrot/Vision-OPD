@@ -1178,6 +1178,12 @@ class DataParallelPPOActor(BasePPOActor):
                                 response_mask=response_mask,
                                 center_u=self_distillation_cfg.get("aha_center_u", False),
                                 token_ids=student_topk_indices,
+                                student_topk_logps=student_topk_logps,
+                                zone_enable=self_distillation_cfg.get("aha_zone_enable", False),
+                                zone_tau=self_distillation_cfg.get("aha_zone_tau", 0.1),
+                                zone_eps=self_distillation_cfg.get("aha_zone_eps", 0.1),
+                                zone_margin=self_distillation_cfg.get("aha_zone_margin", 1.0),
+                                beta_neg=self_distillation_cfg.get("aha_beta_neg", None),
                             )
                             # 重建 q 取代原始 teacher 分布, 之后走与 V0 完全相同的损失路径
                             # (compute_self_distillation_loss, add_tail=True 补回尾桶)。

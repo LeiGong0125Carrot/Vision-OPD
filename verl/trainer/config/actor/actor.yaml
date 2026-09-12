@@ -242,6 +242,13 @@ self_distillation:
   aha_floor_alpha: null
   # Per-token-type centering of u (filters vocabulary-level constant-preference channel)
   aha_center_u: False
+  # TZR three-zone reconstruction (supersedes floor/center): AGREE frozen, EVID boosted,
+  # PRIOR suppressed behind anti-squeeze (student head) + teacher-fallibility (margin) gates
+  aha_zone_enable: False
+  aha_zone_tau: 0.1
+  aha_zone_eps: 0.1
+  aha_zone_margin: 1.0
+  aha_beta_neg: null
   # Parquet column holding the mean-RGB null teacher images
   null_image_key: null
 

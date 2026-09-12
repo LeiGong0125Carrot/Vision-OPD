@@ -169,6 +169,15 @@ class SelfDistillationConfig(BaseConfig):
     # vocabulary-level constant-preference channel; positional uniform centering
     # would be absorbed by softmax shift invariance, so only this form matters).
     aha_center_u: bool = False
+    # TZR three-zone reconstruction (supersedes floor/center): directional beta by
+    # (p+, p0, p_student) head partition — AGREE frozen, EVID boosted, PRIOR suppressed
+    # behind an anti-squeeze gate (student head only) and a teacher-fallibility gate
+    # (margin on p+'s rejection).
+    aha_zone_enable: bool = False
+    aha_zone_tau: float = 0.1
+    aha_zone_eps: float = 0.1
+    aha_zone_margin: float = 1.0
+    aha_beta_neg: Optional[float] = None
     null_image_key: Optional[str] = None
 
     def __post_init__(self):
@@ -236,6 +245,17 @@ class SelfDistillationConfig(BaseConfig):
                 raise ValueError(f"aha_beta must be >= 0, got {self.aha_beta}")
             if self.aha_floor_alpha is not None and not 0.0 < self.aha_floor_alpha < 1.0:
                 raise ValueError(f"aha_floor_alpha must be in (0,1) or None, got {self.aha_floor_alpha}")
+            if self.aha_zone_enable:
+                if self.aha_floor_alpha is not None or self.aha_center_u:
+                    raise ValueError(
+                        "aha_zone_enable supersedes aha_floor_alpha/aha_center_u — they are mutually exclusive."
+                    )
+                if not 0.0 < self.aha_zone_tau < 1.0 or not 0.0 < self.aha_zone_eps < 1.0:
+                    raise ValueError("aha_zone_tau/aha_zone_eps must be in (0,1).")
+                if self.aha_zone_margin < 0:
+                    raise ValueError("aha_zone_margin must be >= 0.")
+                if self.aha_beta_neg is not None and self.aha_beta_neg < 0:
+                    raise ValueError("aha_beta_neg must be >= 0 or None.")
         if self.opsa_enable:
             if self.state_adaptive or self.evt_enable:
                 raise ValueError("opsa_enable is mutually exclusive with state_adaptive and evt_enable.")

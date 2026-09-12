@@ -119,4 +119,59 @@ assert d_clean < 0.35, f"纯恒定通道位置中心化后应≈p⁺, got {d_cle
 # requires_grad 卫生
 assert not qc.requires_grad
 
+# --- 8. TZR 三区重建 ---
+# 8a. zone 关闭时与裸 pair (均匀 β) 逐元素一致 (退化性)
+s_logps = rand_topk_logps()  # 学生分布
+qz_off, _ = reconstruct_aha_target(h, f, beta=beta, floor_alpha=None,
+                                   student_topk_logps=s_logps, zone_enable=False)
+assert torch.allclose(qz_off, qb), "zone 关闭必须逐元素退化为裸 pair"
+
+# 8b. 构造已知三区: dim0=AGREE(双高), dim1=EVID(仅h高), dim2=PRIOR(仅f高,学生高,margin足)
+#     dim3=PRIOR但学生谷区(防挤压门应拦), 其余为双谷噪声
+import torch as T
+def mk(probs):
+    # probs: K 维概率 (和<1, 尾桶吃剩余); 返回 log
+    return T.log(T.tensor(probs)).view(1, 1, -1).expand(1, 2, -1).contiguous()
+K2 = 6
+h2 = mk([0.40, 0.30, 0.001, 0.001, 0.005, 0.003])   # h 头部: dim0,1
+f2 = mk([0.40, 0.002, 0.30, 0.10, 0.005, 0.003])    # f 头部: dim0,2,3
+s2 = mk([0.30, 0.10, 0.25, 0.001, 0.005, 0.003])    # 学生头部: dim0,1,2 (dim3 谷区)
+mask2 = T.ones(1, 2)
+qz, mz = reconstruct_aha_target(h2, f2, beta=2.0, floor_alpha=None,
+                                student_topk_logps=s2, zone_enable=True,
+                                zone_tau=0.1, zone_eps=0.1, zone_margin=1.0,
+                                response_mask=mask2)
+qu, _ = reconstruct_aha_target(h2, f2, beta=2.0, floor_alpha=None)  # 均匀对照
+log_h2 = _sa_add_tail_log_probs(h2.float())
+# AGREE dim0: β=0 → q 的 log-odds 相对 h 不因 u 改变; 用 dim0 vs 尾桶前的噪声维对照难,
+# 直接验证: 三区 q 中 dim0 与 dim1 的 log-odds 差 = log_h 差 + β*(u1) (dim0 β=0, dim1 β=β)
+u2 = log_h2 - _sa_add_tail_log_probs(f2.float())
+lhs = (qz[..., 1] - qz[..., 0])
+rhs = (log_h2[..., 1] - log_h2[..., 0]) + 2.0 * u2[..., 1] - 0.0 * u2[..., 0]
+assert torch.allclose(lhs, rhs, atol=1e-4), "AGREE 冻结 + EVID 抬升的 log-odds 关系不对"
+# PRIOR dim2 (u<0, β_neg=β): 相对 AGREE dim0 应被压
+lhs2 = (qz[..., 2] - qz[..., 0])
+rhs2 = (log_h2[..., 2] - log_h2[..., 0]) + 2.0 * u2[..., 2]
+assert torch.allclose(lhs2, rhs2, atol=1e-4), "PRIOR 压制量应恰为 β_neg*u"
+assert u2[0, 0, 2] < 0, "构造前提: dim2 的 u 应为负"
+# 8c. 防挤压门: dim3 是 PRIOR(f 高)但学生谷区 → 不压 (β=0)
+lhs3 = (qz[..., 3] - qz[..., 0])
+rhs3 = (log_h2[..., 3] - log_h2[..., 0])  # β=0 → 无 u 项
+assert torch.allclose(lhs3, rhs3, atol=1e-4), "学生谷区的 PRIOR 维不得被压 (防挤压门)"
+# 8d. 教师可错门: margin 拉大到教师拒绝不够坚决时, dim2 也不压
+qm, _ = reconstruct_aha_target(h2, f2, beta=2.0, floor_alpha=None,
+                               student_topk_logps=s2, zone_enable=True,
+                               zone_tau=0.1, zone_eps=0.1, zone_margin=50.0,
+                               response_mask=mask2)
+lhsm = (qm[..., 2] - qm[..., 0])
+assert torch.allclose(lhsm, (log_h2[..., 2] - log_h2[..., 0]), atol=1e-4), \
+    "margin 不满足时 PRIOR 不得被压 (教师可错门)"
+# 8e. 归一守恒 + 指标
+assert (qz.exp().sum(-1) < 1.0 + 1e-6).all()
+for k in ["aha/zone_agree_frac", "aha/zone_evid_frac", "aha/zone_prior_frac",
+          "aha/zone_press_frac", "aha/prior_suppressed_mass"]:
+    assert k in mz and math.isfinite(mz[k]), f"缺指标 {k}"
+assert mz["aha/zone_press_frac"] > 0, "构造数据下应有压制发生"
+assert not qz.requires_grad
+
 print("ALL TESTS PASSED")
